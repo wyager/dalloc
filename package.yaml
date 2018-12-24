@@ -1,0 +1,102 @@
+name:                dalloc
+version:             0.1.0.0
+github:              "githubuser/dalloc"
+license:             BSD3
+author:              "Author name here"
+maintainer:          "example@example.com"
+copyright:           "2018 Author name here"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/githubuser/dalloc#readme>
+
+default-extensions:
+- OverloadedLists
+- OverloadedStrings
+- DataKinds
+- TypeOperators
+- MultiParamTypeClasses
+- DeriveGeneric
+- FlexibleContexts
+- FlexibleInstances
+- LambdaCase
+- ScopedTypeVariables
+- GeneralizedNewtypeDeriving
+- DerivingStrategies
+- DeriveAnyClass
+- TypeApplications
+- DeriveFunctor
+- DeriveFoldable
+- TypeFamilies
+- PolyKinds
+- RankNTypes
+- GADTs
+- InstanceSigs
+- NoMonomorphismRestriction
+- EmptyCase
+- QuantifiedConstraints
+- TupleSections
+- RecordWildCards
+- DerivingVia
+- MultiWayIf
+
+dependencies:
+- base >= 4.7 && < 5
+
+library:
+  source-dirs: src
+  dependencies:
+  - bytestring
+  - mtl
+  - store
+  - data-fix
+  - streaming
+  - transformers
+  - stm
+  - profunctors
+  - vector
+  - bifunctors
+  - free
+  ghc-options:
+  - -O2
+  - -Wall
+  - -Werror
+
+executables:
+  dalloc-exe:
+    main:                Main.hs
+    source-dirs:         app
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    - -O2
+    dependencies:
+    - dalloc
+    - bytestring
+    - store
+    - vector
+    - binary
+    - cereal
+    - containers
+    - streaming
+
+tests:
+  dalloc-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - dalloc

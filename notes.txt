@@ -1,0 +1,6 @@
+Architecture:
+
+Generational heap
+
+Each heap segment follows command pattern
+
