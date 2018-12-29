@@ -49,6 +49,7 @@ default-extensions:
 - DerivingVia
 - MultiWayIf
 - FunctionalDependencies
+- ConstraintKinds
 
 dependencies:
 - base >= 4.7 && < 5

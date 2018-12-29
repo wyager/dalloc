@@ -1,4 +1,4 @@
-module Lib.GiST where
+module Lib.GiST () where
 
 -- import GHC.TypeLits (Nat, type (+))
 import Data.Vector.Generic as Vec (Vector, concat, filter, foldl, cons, toList, imap, ifoldl, singleton, length, fromList, head, tail, splitAt, empty)
