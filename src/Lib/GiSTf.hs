@@ -9,14 +9,16 @@ import Data.Foldable (fold)
 import Data.List (sort, sortOn, splitAt)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose(Compose))
+import Data.Functor.Sum (Sum(InL,InR))
 import GHC.Exts (Constraint)
 import Data.Proxy (Proxy(Proxy))
 
 data Nat = Z | S Nat
 
-data AFew xs = One xs | Two xs xs deriving Functor
+data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
 
+type f ∘ g = Compose f g
 
 class Ord (Penalty set) => Key key set | set -> key where
     type Penalty set :: *
@@ -24,6 +26,7 @@ class Ord (Penalty set) => Key key set | set -> key where
     overlaps :: set -> set -> Bool
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
+    -- Must maintain key invariants during a split. "penalty" should probably handle invariants during a non-split
     partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
     -- Insertion is not handled by "penalty", must go here
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
@@ -47,7 +50,9 @@ instance (Hoist Show f, Show a) => Show (Freen height f a) where
 
 newtype Node set a = Node (V.Vector (set,a)) deriving Functor
 
-newtype GiSTn height f vec set key value = GiSTn (Freen height (Compose (Node set) f) (vec (key,value)))
+
+type Rec height f vec set key value = Freen height (Node set ∘ f) (vec (key,value))
+newtype GiSTn height f vec set key value = GiSTn (Rec height f vec set key value)
 
 
 class (Vector vec (key,value), Key key set) => IsGiST vec set key value 
@@ -139,42 +144,46 @@ data FillFactor = FillFactor {minFill :: Int, maxFill :: Int}
 --             One gist -> Left gist
 --             Two g1 g2 -> Right $ Node (wrap g1) (Vec.singleton (wrap g2))
         
+insertAndSplit :: forall height read vec set key value write . (IsGiST vec set key value, Key set value, Monad read) 
+               => FillFactor 
+               -> (vec (key,value)                 -> write (Rec 'Z           write vec set key value)) -- Save leaf
+               -> (forall height' . Node set (Either (write (Rec height'      write vec set key value)) 
+                                                     (read  (Rec height'      read  vec set key value))) 
+                                 -> write                   (Rec ('S height') write vec set key value)) -- Save node
+               -> key -> value
+               ->                         Rec height read vec set key value     -- The thing to save
+               -> read (AFew (set, write (Rec height write vec set key value))) -- That which has been saved
+insertAndSplit ff@FillFactor{..}  saveLeaf saveNode key value free  = case free of
+        Pure vec -> return $ fmap (\leaf -> (unions (preds (GiSTn (Pure leaf))), saveLeaf leaf)) $ insertKey (Proxy @set) ff key value vec 
+        node@(Free (Compose (Node vec))) -> 
+            case chooseSubtree (GiSTn node) (exactly key) of
+                Nothing -> error "GiST node is empty, violating data structure invariants" -- Could also just deal with it
+                Just (bestIx, best) -> do 
+                    best' <- best
+                    inserted  <- insertAndSplit ff saveLeaf saveNode key value best'
+                    let save (set,gist) = 
+                                let vec' = Vec.imap (\i old -> if i == bestIx then (set, Left gist)  else fmap Right old) vec in
+                                let set' = unions $ map fst $ Vec.toList vec' in 
+                                (set', saveNode (Node vec'))
+                    return (fmap save inserted)
 
--- insertAndSplit :: forall vn vl height set key value . (GiSTy vn vl set key value, Partition set) 
---                => FillFactor 
---                -> key -> value
---                ->       GiST vn vl height set key value
---                -> AFew (GiST vn vl height set key value) 
--- insertAndSplit  ff@FillFactor{..} key value node  = case node of
---         Leaf vec -> partition ff (Leaf $ Vec.cons (key,value) vec) -- NB: The leaf partition function should keep order if desired, need to figure out an API for that
---         Node e vec -> partition ff (Node eNew vecNew)
---             where 
---             (bestIx, best) = chooseSubtree node (exactly key)
---             inserted = insertAndSplit ff key value best 
---             (eNew, vecNew) = case inserted of
---                 One gist -> case bestIx of
---                     Zero -> (wrap gist, vec)
---                     OnePlus ix -> (e, Vec.imap (\i old -> if i == ix then wrap gist else old) vec)
---                 Two new1 new2 -> case bestIx of
---                     Zero -> (wrap new1, Vec.cons (wrap new2) vec)
---                     OnePlus ix -> (e, Vec.cons (wrap new1) (Vec.imap (\i old -> if i == ix then (wrap new2) else old) vec))
 
--- wrap :: GiSTy vn vl set key value => GiST vn vl height set key value-> Rec vn vl ('S height) set key value
+-- wrap :: IsGiST vec set key value => GiSTn height f vec set key value-> (set, )
 -- wrap node = Rec (unions $ preds node) node
 
--- data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
--- instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
--- instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (unignored y)
+data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
+instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
+instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (unignored y)
 
--- data Index = Zero | OnePlus Int
 
--- chooseSubtree :: GiSTy vn vl set key value 
---               => GiST vn vl ('S height) set key value 
---               -> set 
---               -> (Index, GiST vn vl height set key value)
--- chooseSubtree (Node e vec) predicate = ignored $ getMin $ Vec.ifoldl (\best i next -> best <> f (OnePlus i) next) (f Zero e) vec
---     where
---     f ix (Rec subpred subgist) = Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
+chooseSubtree :: forall vec set key value height f . (Functor f, IsGiST vec set key value)
+              => GiSTn ('S height) f vec set key value 
+              -> set 
+              -> Maybe (Int, f (Rec height f vec set key value))
+chooseSubtree (GiSTn (Free (Compose (Node vec)))) predicate = ignored . getMin <$> bestSubtree
+    where
+    bestSubtree = Vec.ifoldl (\best i next -> best <> f i next) Nothing vec
+    f ix (subpred, subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
 
 
 data Within a = Within {withinLo :: a, withinHi :: a} | Empty deriving (Eq, Ord, Show)

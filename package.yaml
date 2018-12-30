@@ -50,6 +50,7 @@ default-extensions:
 - MultiWayIf
 - FunctionalDependencies
 - ConstraintKinds
+- DeriveTraversable
 
 dependencies:
 - base >= 4.7 && < 5
