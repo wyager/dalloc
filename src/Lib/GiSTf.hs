@@ -10,6 +10,7 @@ import Data.List (sort, sortOn, splitAt)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose(Compose))
 import GHC.Exts (Constraint)
+import Data.Proxy (Proxy(Proxy))
 
 data Nat = Z | S Nat
 
@@ -23,15 +24,24 @@ class Ord (Penalty set) => Key key set | set -> key where
     overlaps :: set -> set -> Bool
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
+    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
+    -- Insertion is not handled by "penalty", must go here
+    -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
+    insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
 
 
 data Freen (n :: Nat) f a where
     Pure :: a -> Freen 'Z f a
     Free :: f (Freen n f a) -> Freen ('S n) f a
 
-type Show1 (f :: * -> *) = (forall s . Show s => Show (f s) :: Constraint)
+instance Functor f => Functor (Freen n f) where
+    fmap f (Pure a) = Pure (f a)
+    fmap f (Free g) = Free (fmap (fmap f) g)
 
-instance (Show1 f, Show a) => Show (Freen height f a) where
+
+type Hoist c f = (forall s . c s => c (f s) :: Constraint)
+
+instance (Hoist Show f, Show a) => Show (Freen height f a) where
     show (Pure a) = "Pure " ++ show a
     show (Free f) = "Free " ++ show f
 
@@ -49,9 +59,11 @@ preds (GiSTn free) = case free of
     Pure vec -> map (exactly . fst) $ Vec.toList vec
     Free (Compose (Node vec)) -> map fst $ Vec.toList vec
 
+
+
 search' :: forall vec height f set key value m 
         . (IsGiST vec set key value, Monoid m, Monad f) 
-        => (vec (key,value) -> m) 
+        => (vec (key,value) -> f m) -- You can either use the monoid m or the monad f to get the result out.
         -> set 
         -> GiSTn height f vec set key value 
         -> f m
@@ -59,7 +71,7 @@ search' embed predicate = go
     where
     go :: forall height' . GiSTn height' f vec set key value -> f m
     go (GiSTn free) = case free of
-        Pure vec -> pure (embed (Vec.filter (overlaps predicate . exactly . fst) vec))
+        Pure vec -> embed (Vec.filter (overlaps predicate . exactly . fst) vec)
         Free (Compose (Node vec)) -> 
             let f acc (subpred, subgist) = if overlaps predicate subpred 
                 then do
@@ -70,23 +82,15 @@ search' embed predicate = go
             in 
             Vec.foldM f mempty vec
 
--- instance (IsGiST vec set key value, Show (vec (key,value)), (forall a . Show a => Show (f a))) => Show (GiSTn height f vec set key value) where
 
 
 
--- class Partition set where
---     partition :: (Key key set, GiSTy vn vl set key value) => FillFactor -> GiST vn vl height set key value -> AFew (GiST vn vl height set key value)
-
+-- class Partition x where
+--     partition :: Vector vec (x,val) => FillFactor -> vec (x,val) -> AFew (vec (x,val))
 
 -- class (forall height . Vector vn (Rec vn vl ('S height) set key value), Vector vl (key, value), Key key set) => GiSTy vn vl set key value 
 
 
--- data GiST vn vl (height :: Nat) set key value where
---     Leaf :: vl (key, value) 
---             -> GiST vn vl 'Z          set key value
---     Node ::     Rec vn vl ('S height) set key value 
---          -> vn (Rec vn vl ('S height) set key value) 
---          ->    GiST vn vl ('S height) set key value
 
 -- -- Have to make this because of 
 -- -- "Data constructor ‘NodeEntry’ cannot be used here
@@ -95,16 +99,6 @@ search' embed predicate = go
 --     Rec :: set 
 --         -> GiST vn vl     height  set key value 
 --         -> Rec  vn vl ('S height) set key value
-
-
--- free :: GiSTy vn vl set key value => GiST vn vl height set key value -> Free (Compose [] ((,) set)) [(key, value)]
--- free (Leaf as) = Pure (Vec.toList as)
--- free (Node e es) = Free $ Compose $ map (\(Rec p g) -> (p, free g)) $ e : Vec.toList es
-
-
--- instance (GiSTy vn vl set key value, Show value, Show set, Show key) => Show (GiST vn vl height set key value) where
---     show = show . free
-
 
 
 -- data Entry vn vl height set key value where
@@ -126,8 +120,10 @@ cat a = Cat (a:)
 dog :: Cat a -> [a]
 dog (Cat f) = f []
 
+-- Todo: Implement streaming search by lifting f to a Stream
 search :: (IsGiST vec set key value, Monad f) => set -> GiSTn height f vec set key value -> f (vec (key,value))
-search predicate gist = Vec.concat . dog <$> search' cat predicate gist
+search predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
+
 
 -- contains set == not . null . search set
 -- To actually optimize this properly, I need to provide a primitive like
@@ -135,7 +131,7 @@ search predicate gist = Vec.concat . dog <$> search' cat predicate gist
 -- contains :: GiSTy vn vl set key value => set -> GiST vn vl n set key value -> Bool
 -- contains predicate = getAny . search' (const (Any True)) predicate
 
--- data FillFactor = FillFactor {minFill :: Int, maxFill :: Int}
+data FillFactor = FillFactor {minFill :: Int, maxFill :: Int}
 
 -- insert :: (GiSTy vn vl set key value, Partition set) => FillFactor -> key -> value 
 --        -> GiST vn vl height set key value -> Either (GiST vn vl height set key value) (GiST vn vl ('S height) set key value)
