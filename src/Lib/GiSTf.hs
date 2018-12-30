@@ -1,7 +1,7 @@
 module Lib.GiSTf where
 
 -- import GHC.TypeLits (Nat, type (+))
-import qualified Data.Vector as V (Vector)
+import qualified Data.Vector as V (Vector, fromList)
 import Data.Vector.Generic as Vec (Vector, concat, filter, foldl, cons, toList, imap, ifoldl, singleton, length, fromList, head, tail, splitAt, empty, foldM)
 import Data.Monoid (Endo(..), Any(Any,getAny))
 import Data.Semigroup (Min(Min,getMin))
@@ -138,38 +138,40 @@ search predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gi
 
 data FillFactor = FillFactor {minFill :: Int, maxFill :: Int}
 
--- insert :: (GiSTy vn vl set key value, Partition set) => FillFactor -> key -> value 
---        -> GiST vn vl height set key value -> Either (GiST vn vl height set key value) (GiST vn vl ('S height) set key value)
--- insert ff k v g = case insertAndSplit ff  k v g of
---             One gist -> Left gist
---             Two g1 g2 -> Right $ Node (wrap g1) (Vec.singleton (wrap g2))
+
+
+class (IsGiST vec set key value) => RW read write vec set key value | write -> read where
+    saveLeaf :: vec (key, value) -> write (Rec 'Z           write vec set key value)
+    saveNode :: Node set (Either   (write (Rec height       write vec set key value)) 
+                                   (read  (Rec height       read  vec set key value))) 
+                                 -> write (Rec ('S height)  write vec set key value) -- Save node
+
+insert :: forall write height read vec set key value .  (Monad read, Functor write, RW read write vec set key value)  
+       => FillFactor -> key -> value 
+       -> GiSTn height read vec set key value -> read (write (Either (GiSTn height write vec set key value) (GiSTn ('S height) write vec set key value)))
+insert ff k v (GiSTn g) = insertAndSplit @write ff k v g >>= \case
+            One (set, gist) -> return $ fmap (Left  . GiSTn) $ gist
+            Two a b         -> return $ fmap (Right . GiSTn) $ saveNode $ Node $ V.fromList [fmap Left a, fmap Left b]
         
-insertAndSplit :: forall height read vec set key value write . (IsGiST vec set key value, Key set value, Monad read) 
-               => FillFactor 
-               -> (vec (key,value)                 -> write (Rec 'Z           write vec set key value)) -- Save leaf
-               -> (forall height' . Node set (Either (write (Rec height'      write vec set key value)) 
-                                                     (read  (Rec height'      read  vec set key value))) 
-                                 -> write                   (Rec ('S height') write vec set key value)) -- Save node
+insertAndSplit :: forall write height read vec set key value . (Monad read, RW read write vec set key value) 
+               => FillFactor
                -> key -> value
                ->                         Rec height read vec set key value     -- The thing to save
                -> read (AFew (set, write (Rec height write vec set key value))) -- That which has been saved
-insertAndSplit ff@FillFactor{..}  saveLeaf saveNode key value free  = case free of
+insertAndSplit ff@FillFactor{..} key value free  = case free of
         Pure vec -> return $ fmap (\leaf -> (unions (preds (GiSTn (Pure leaf))), saveLeaf leaf)) $ insertKey (Proxy @set) ff key value vec 
         node@(Free (Compose (Node vec))) -> 
             case chooseSubtree (GiSTn node) (exactly key) of
                 Nothing -> error "GiST node is empty, violating data structure invariants" -- Could also just deal with it
                 Just (bestIx, best) -> do 
                     best' <- best
-                    inserted  <- insertAndSplit ff saveLeaf saveNode key value best'
+                    inserted  <- insertAndSplit ff key value best'
                     let save (set,gist) = 
                                 let vec' = Vec.imap (\i old -> if i == bestIx then (set, Left gist)  else fmap Right old) vec in
                                 let set' = unions $ map fst $ Vec.toList vec' in 
                                 (set', saveNode (Node vec'))
                     return (fmap save inserted)
 
-
--- wrap :: IsGiST vec set key value => GiSTn height f vec set key value-> (set, )
--- wrap node = Rec (unions $ preds node) node
 
 data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
 instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
