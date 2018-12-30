@@ -2,7 +2,7 @@ module Lib.GiSTf where
 
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector, fromList)
-import Data.Vector.Generic as Vec (Vector, concat, filter, foldl, cons, toList, imap, ifoldl, singleton, length, fromList, head, tail, splitAt, empty, foldM)
+import Data.Vector.Generic as Vec (Vector, concat, filter, foldl, cons, toList, imap, ifoldl, singleton, length, fromList, head, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..), Any(Any,getAny))
 import Data.Semigroup (Min(Min,getMin))
 import Data.Foldable (fold)
@@ -26,7 +26,7 @@ class Ord (Penalty set) => Key key set | set -> key where
     overlaps :: set -> set -> Bool
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
-    -- Must maintain key invariants during a split. "penalty" should probably handle invariants during a non-split
+    -- If there are order invariants, this function should maintain them. We only call partitionSets if we've inserted a new entry, so "penalty" should enforce them otherwise
     partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
     -- Insertion is not handled by "penalty", must go here
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
@@ -165,12 +165,18 @@ insertAndSplit ff@FillFactor{..} key value free  = case free of
                 Nothing -> error "GiST node is empty, violating data structure invariants" -- Could also just deal with it
                 Just (bestIx, best) -> do 
                     best' <- best
-                    inserted  <- insertAndSplit ff key value best'
-                    let save (set,gist) = 
-                                let vec' = Vec.imap (\i old -> if i == bestIx then (set, Left gist)  else fmap Right old) vec in
-                                let set' = unions $ map fst $ Vec.toList vec' in 
-                                (set', saveNode (Node vec'))
-                    return (fmap save inserted)
+                    inserted <- insertAndSplit ff key value best'
+                    case inserted of
+                        One (set,gist) -> 
+                            let vec' = Vec.imap (\i old -> if i == bestIx then (set, Left gist) else fmap Right old) vec in
+                            let set' = unions $ map fst $ Vec.toList vec' in 
+                            return (One (set', saveNode (Node vec')))
+                        Two l r -> 
+                            let vec' = Vec.fromList (fmap (fmap Left) [l,r]) <> (fmap (fmap Right) vec) in
+                            case partitionSets ff vec' of 
+                                One vec'' -> return (One (unions (fmap fst vec''), saveNode (Node vec'')))
+                                Two v1 v2 -> undefined
+                    -- return (fmap save inserted)
 
 
 data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
@@ -211,6 +217,15 @@ instance (Ord a, Num a) => Key a (Within a) where
     overlaps _ Empty = False
     unions = fold
     penalty old new = size (old <> new) - size old
+    insertKey _ ff k v vec = 
+        if Vec.length new <= maxFill ff
+            then One new
+            else let (l,r) = Vec.splitAt (Vec.length new `div` 2) new in Two l r
+        where
+        (before,after) = Vec.span ((<= k) . fst) vec
+        new = Vec.concat [before, Vec.singleton (k,v), after]
+    partitionSets = undefined
+
 
 
 -- instance (Ord a) => Partition (Within a) where
