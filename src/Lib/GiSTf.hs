@@ -12,10 +12,17 @@ import Data.Functor.Compose (Compose(Compose))
 import Data.Functor.Sum (Sum(InL,InR))
 import GHC.Exts (Constraint)
 import Data.Proxy (Proxy(Proxy))
+import Data.Functor.Classes (Show1)
+import Data.Functor.Identity (Identity(..))
+import qualified Data.Vector.Unboxed as U
 
 data Nat = Z | S Nat
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
+
+data V2 x = V2 x x
+
+-- newtype Update v = Update (Maybe v -> v -> v)
 
 
 type f ∘ g = Compose f g
@@ -27,7 +34,7 @@ class Ord (Penalty set) => Key key set | set -> key where
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
     -- If there are order invariants, this function should maintain them. We only call partitionSets if we've inserted a new entry, so "penalty" should enforce them otherwise
-    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
+    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> Int -> V2 (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
     -- Insertion is not handled by "penalty", must go here
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
     insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
@@ -48,14 +55,19 @@ instance (Hoist Show f, Show a) => Show (Freen height f a) where
     show (Pure a) = "Pure " ++ show a
     show (Free f) = "Free " ++ show f
 
-newtype Node set a = Node (V.Vector (set,a)) deriving Functor
-
+newtype Node set a = Node (V.Vector (set,a)) deriving (Functor, Show)
 
 type Rec height f vec set key value = Freen height (Node set ∘ f) (vec (key,value))
 newtype GiSTn height f vec set key value = GiSTn (Rec height f vec set key value)
 
+instance (Hoist Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiSTn height f vec set key value) where
+    show (GiSTn gist) = case gist of
+        Pure a -> "Leaf " ++ show a
+        Free (Compose (Node vec)) -> "Node " ++ show (fmap (\(set,node) -> (set,fmap GiSTn node)) vec)
+
 
 class (Vector vec (key,value), Key key set) => IsGiST vec set key value 
+instance (U.Unbox key, U.Unbox value, Key key set) => IsGiST U.Vector set key value
 
 
 
@@ -126,8 +138,8 @@ dog :: Cat a -> [a]
 dog (Cat f) = f []
 
 -- Todo: Implement streaming search by lifting f to a Stream
-search :: (IsGiST vec set key value, Monad f) => set -> GiSTn height f vec set key value -> f (vec (key,value))
-search predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
+list' :: (IsGiST vec set key value, Monad f) => set -> GiSTn height f vec set key value -> f (vec (key,value))
+list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
 
 
 -- contains set == not . null . search set
@@ -146,10 +158,14 @@ class (IsGiST vec set key value) => RW read write vec set key value | write -> r
                                    (read  (Rec height       read  vec set key value))) 
                                  -> write (Rec ('S height)  write vec set key value) -- Save node
 
-insert :: forall write height read vec set key value .  (Monad read, Functor write, RW read write vec set key value)  
+instance IsGiST vec set key value => RW Identity Identity vec set key value where
+    saveLeaf = Identity . Pure
+    saveNode = Identity . Free . Compose . fmap (either id id)
+
+insert' :: forall write height read vec set key value .  (Monad read, Functor write, RW read write vec set key value)  
        => FillFactor -> key -> value 
        -> GiSTn height read vec set key value -> read (write (Either (GiSTn height write vec set key value) (GiSTn ('S height) write vec set key value)))
-insert ff k v (GiSTn g) = insertAndSplit @write ff k v g >>= \case
+insert' ff k v (GiSTn g) = insertAndSplit @write ff k v g >>= \case
             One (set, gist) -> return $ fmap (Left  . GiSTn) $ gist
             Two a b         -> return $ fmap (Right . GiSTn) $ saveNode $ Node $ V.fromList [fmap Left a, fmap Left b]
         
@@ -172,10 +188,11 @@ insertAndSplit ff@FillFactor{..} key value free  = case free of
                             let set' = unions $ map fst $ Vec.toList vec' in 
                             return (One (set', saveNode (Node vec')))
                         Two l r -> 
-                            let vec' = Vec.fromList (fmap (fmap Left) [l,r]) <> (fmap (fmap Right) vec) in
-                            case partitionSets ff vec' of 
-                                One vec'' -> return (One (unions (fmap fst vec''), saveNode (Node vec'')))
-                                Two v1 v2 -> undefined
+                            let vec' = fmap (fmap Right) vec in
+                            let wrap vec'' = (unions (fmap fst vec''), saveNode (Node vec'')) in
+                            case partitionSets ff vec' bestIx (V2 (fmap Left l) (fmap Left r)) of 
+                                One vec'' -> return (One (wrap vec''))
+                                Two v1 v2 -> return (Two (wrap v1) (wrap v2))
                     -- return (fmap save inserted)
 
 
@@ -224,38 +241,33 @@ instance (Ord a, Num a) => Key a (Within a) where
         where
         (before,after) = Vec.span ((<= k) . fst) vec
         new = Vec.concat [before, Vec.singleton (k,v), after]
-    partitionSets = undefined
+    partitionSets ff vec i (V2 l r) =
+        let (before, after') = Vec.splitAt i vec in
+        let after = Vec.tail after' in
+        let new = Vec.concat [before, Vec.fromList [l,r], after] in
+        if Vec.length new <= maxFill ff
+            then One new
+            else let (lo,hi) = Vec.splitAt (Vec.length new `div` 2) new in Two lo hi
+            
 
 
 
--- instance (Ord a) => Partition (Within a) where
---     partition ff (Leaf v) = if Vec.length v <= maxFill ff
---         then One (Leaf v)
---         else Two (Leaf l) (Leaf r)
---         where (l,r) = Vec.splitAt (Vec.length v `div` 2) v
---     partition ff (Node e v) = if Vec.length v + 1 <= maxFill ff
---         then One (Node e v)
---         else Two (Node el vl) (Node er vr)
---         where 
---         el = e
---         (vl,vr') = Vec.splitAt (Vec.length v `div` 2) v
---         (er,vr) = (Vec.head vr', Vec.tail vr')
+data GiST f vec set key value where
+    GiST :: GiSTn height f vec set key value -> GiST f vec set key value
+
+instance (Hoist Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
+    show (GiST g) = show g
 
 
+insert :: (Monad read, Functor write, RW read write vec set key value)  
+       => FillFactor -> key -> value 
+       -> GiST read vec set key value -> read (write (GiST write vec set key value))
+insert ff k v (GiST g) = fmap (fmap (either GiST GiST)) $ insert' ff k v g
 
+empty :: IsGiST vec set key value => GiST f vec set key value
+empty = GiST (GiSTn (Pure Vec.empty))
 
--- data SomeGiST vn vl set key value where
---     SomeGiST :: GiST vn vl height set key value -> SomeGiST vn vl set key value
+list :: (Monad f, IsGiST vec set key value) => set -> GiST f vec set key value -> f (vec (key,value))
+list set (GiST g) = list' set g
 
--- instance (GiSTy vn vl set key value, Show value, Show key, Show set) => Show (SomeGiST vn vl set key value) where
---     show (SomeGiST g) = show g
-
--- insert' :: (GiSTy vn vl set key value, Partition set) => FillFactor -> key -> value -> SomeGiST vn vl set key value -> SomeGiST vn vl set key value
--- insert' ff k v (SomeGiST g) = either SomeGiST SomeGiST $ insert ff k v g
-
--- empty :: GiSTy vn vl set key value => SomeGiST vn vl set key value
--- empty = SomeGiST (Leaf Vec.empty)
-
--- search'' ::GiSTy vn vl set key value => set -> SomeGiST vn vl set key value -> vl (key,value)
--- search'' set (SomeGiST g) = search set g
 

@@ -20,8 +20,8 @@ instance Store Ptr where
 class StoreM m where
     store :: ByteString -> m Ptr
 
-f :: (Monad m, StoreM m, (forall a . Store a => Store (f a))) => m (Fix f)
-f = undefined
+-- f :: (Monad m, StoreM m, (forall a . Store a => Store (f a))) => m (Fix f)
+-- f = undefined
 
 -- data Chunk = ChunkPtr Ptr | ChunkBS ByteString
 
