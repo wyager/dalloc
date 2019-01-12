@@ -72,6 +72,8 @@ library:
   - async
   - deepseq
   - stm-chans
+  - lrucaching
+  - hashable
   ghc-options:
   - -O2
   - -Wall
