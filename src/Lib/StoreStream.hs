@@ -9,6 +9,7 @@ import           Data.ByteString (ByteString)
 
 data Sized a = Sized !Word64 !a 
 
+
 instance Store a => Store (Sized a) where
     size = case size :: Size a of
         VarSize f -> VarSize (\(Sized _ a) -> 8 + f a)

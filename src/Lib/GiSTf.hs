@@ -22,9 +22,6 @@ data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
 data V2 x = V2 x x
 
--- newtype Update v = Update (Maybe v -> v -> v)
-
-
 type f ∘ g = Compose f g
 
 class Ord (Penalty set) => Key key set | set -> key where
@@ -33,9 +30,7 @@ class Ord (Penalty set) => Key key set | set -> key where
     overlaps :: set -> set -> Bool
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
-    -- If there are order invariants, this function should maintain them. We only call partitionSets if we've inserted a new entry, so "penalty" should enforce them otherwise
-    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> Int -> V2 (set,val) -> AFew (vec (set,val)) -- Insertion spot is handled by "penalty"
-    -- Insertion is not handled by "penalty", must go here
+    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> Int -> V2 (set,val) -> AFew (vec (set,val)) 
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
     insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
 
@@ -44,10 +39,13 @@ data Freen (n :: Nat) f a where
     Pure :: a -> Freen 'Z f a
     Free :: f (Freen n f a) -> Freen ('S n) f a
 
+iterM :: (Monad m, Functor f) => (f (m a) -> m a) -> Freen n f a -> m a
+iterM _ (Pure a) = return a
+iterM g (Free f) = g (fmap (iterM g) f)
+
 instance Functor f => Functor (Freen n f) where
     fmap f (Pure a) = Pure (f a)
     fmap f (Free g) = Free (fmap (fmap f) g)
-
 
 type Hoist c f = (forall s . c s => c (f s) :: Constraint)
 
@@ -98,31 +96,6 @@ search' embed predicate = go
                 else return acc
             in 
             Vec.foldM f mempty vec
-
-
-
-
--- class Partition x where
---     partition :: Vector vec (x,val) => FillFactor -> vec (x,val) -> AFew (vec (x,val))
-
--- class (forall height . Vector vn (Rec vn vl ('S height) set key value), Vector vl (key, value), Key key set) => GiSTy vn vl set key value 
-
-
-
--- -- Have to make this because of 
--- -- "Data constructor ‘NodeEntry’ cannot be used here
--- --        (it is defined and used in the same recursive group)"
--- data Rec vn vl height set key value where
---     Rec :: set 
---         -> GiST vn vl     height  set key value 
---         -> Rec  vn vl ('S height) set key value
-
-
--- data Entry vn vl height set key value where
---     LeafEntry :: key -> value -> Entry vn vl 'Z set key value
---     NodeEntry :: Rec vn vl ('S height) set key value -> Entry vn vl ('S height) set key value
-
-
 
 
 
