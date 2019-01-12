@@ -2,6 +2,7 @@ module Lib.System () where
 
 import           Data.Store (Store, encode) 
 import           Control.Concurrent.Async (Async, async)
+import           Control.Concurrent (forkIO)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, writeTVar)
 import           Control.DeepSeq (force)
@@ -68,16 +69,39 @@ write (WriteQueue q) value = async $ do
 
 data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
-data ReaderConfig = ReaderConfig
+data ReaderConfig = ReaderConfig {
+        readRef :: Ref -> IO ByteString,
+        lruSize :: Int
+    }
 
+-- We can have the reader cache StoredOffsets if it coordinates with GC to dump these when appropriate, 
+-- which would let us avoid having to read StoredOffsets for every read on popular segments
+-- Could also have a separate GC-state object which holds handles and StoredOffsets
 data ReaderState = ReaderState {
     cached :: LruCache Ref ByteString,
     pending :: Map Ref [TMVar ByteString]
 }
 
 
-readerStep :: ReaderConfig -> ReaderState -> REnqueued -> IO (ReaderState, Maybe Ref)
-readerStep ReaderConfig state@ReaderState{..} = \case
+reader :: ReaderConfig -> ReadQueue -> IO void
+reader ReaderConfig{..} (ReadQueue q) = go initial
+    where
+    initial = ReaderState (Lru.empty lruSize) Map.empty
+    go state = do
+        enqueued <- atomically $ readTBChan q
+        (state', toDispatch) <- readerStep state enqueued
+        case toDispatch of
+            Nothing -> return ()
+            Just ref -> do
+                forkIO $ do
+                    bs <- readRef ref
+                    atomically $ writeTBChan q (ReadComplete ref bs)
+                return ()
+        go state'
+
+
+readerStep :: ReaderState -> REnqueued -> IO (ReaderState, Maybe Ref)
+readerStep state@ReaderState{..} = \case
     Read ref done -> case Lru.lookup ref cached of
         Nothing -> 
             let combine _k new old = new ++ old in
@@ -96,7 +120,7 @@ readerStep ReaderConfig state@ReaderState{..} = \case
                 return (state {pending = pending'}, Nothing)
 
 
--- Sharded by segment hash
+-- Sharded by segment hash (could use ref hash, I suppose, but probably removes optimization opportunities)
 data Readers = Readers {shardShift :: Int, 
                         shards :: V.Vector ReadQueue}
 
@@ -110,8 +134,6 @@ data ConsumerLimits = ConsumerLimits {
         cutoffCount :: Int,
         cutoffLength :: Offset
     }
-
-
 
 data FinishedWith = Cutover | QueueDepleted
 
