@@ -18,6 +18,8 @@ import           System.IO (Handle, hFlush)
 import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Generic as VG
 import qualified Data.Vector as V
 import           Data.LruCache as Lru (LruCache, empty, insert, lookup, insertView)
 import           Data.Hashable (Hashable)
@@ -34,9 +36,22 @@ newtype Ix = Ix Word64
 newtype Offset = Offset Word64 
     deriving newtype (Eq, Ord, Store, Storable)
 
+data Assoc = Assoc !Ix !Offset
+
+assocPtrs :: Ptr Assoc -> (Ptr Ix, Ptr Offset)
+assocPtrs ptr = (castPtr ptr, castPtr ptr `plusPtr` 8)
+instance Storable Assoc where
+    sizeOf _ = 16
+    alignment _ = 8
+    peek ap = let (ip,op) = assocPtrs ap in Assoc <$> peek ip <*> peek op
+    poke ap (Assoc i o) = let (ip,op) = assocPtrs ap in poke ip i >> poke op o
+
+
 -- Add constructor for sparse offsets
-newtype StoredOffsets = OffsetVector (VS.Vector Offset)
-    deriving newtype (Store, NFData)
+data StoredOffsets = OffsetVector (VS.Vector Offset)
+                   | SparseVector (VS.Vector Assoc)
+    deriving stock Generic
+    deriving anyclass (Store, NFData)
 
 offset :: StoredOffsets -> Ix -> Offset
 offset (OffsetVector v) (Ix i) = v VS.! (fromIntegral i)
@@ -231,8 +246,8 @@ data ConsumerLimits = ConsumerLimits {
         cutoffLength :: Offset
     }
 
-
--- gc :: Foldable f => (ByteString ->  Ref)
+-- todo: Lift out some of the logic from the consumer to reuse here
+-- gc :: (ByteString -> VS.Vector Ref) -> (Ref -> Bool) -> StoredOffsets -> ByteString -> (ByteString -> m ())
 
 data FinishedWith = Cutover | QueueDepleted
 
@@ -296,6 +311,7 @@ finalize ConsumerConfig{..} ConsumerState{..} = do
     let offsets = OffsetVector (VS.fromList (keys entries))
         storedOffsets = encode offsets
         offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
+    ByteString.hPut commandLog $ encode (maxBound :: Word64)
     ByteString.hPut commandLog storedOffsets
     ByteString.hPut commandLog $ encode offsetsLen
 
