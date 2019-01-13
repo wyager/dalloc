@@ -5,7 +5,7 @@ import           Control.Concurrent.Async (Async, async)
 import           Control.Concurrent (forkIO)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
 import           Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, writeTVar)
-import           Control.DeepSeq (force)
+import           Control.DeepSeq (NFData, force)
 import           Control.Exception (evaluate)
 import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, readTBMChan)
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
@@ -22,22 +22,24 @@ import qualified Data.Vector as V
 import           Data.LruCache as Lru (LruCache, empty, insert, lookup, insertView)
 import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
+import           Foreign.Ptr (Ptr, plusPtr, castPtr)
+import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
 
-newtype Segment = Segment Int
-    deriving newtype (Eq,Ord,Hashable)
+newtype Segment = Segment Word64
+    deriving newtype (Eq,Ord,Hashable, Store, Storable)
 
-newtype Ix = Ix Int
-    deriving newtype (Eq,Ord,Hashable)
+newtype Ix = Ix Word64
+    deriving newtype (Eq,Ord,Hashable, Store, Storable)
 
 newtype Offset = Offset Word64 
-    deriving newtype (Eq, Ord, Store, VS.Storable)
+    deriving newtype (Eq, Ord, Store, Storable)
 
 -- Add constructor for sparse offsets
 newtype StoredOffsets = OffsetVector (VS.Vector Offset)
-    deriving newtype Store
+    deriving newtype (Store, NFData)
 
 offset :: StoredOffsets -> Ix -> Offset
-offset (OffsetVector v) (Ix i) = v VS.! i
+offset (OffsetVector v) (Ix i) = v VS.! (fromIntegral i)
 
 
 plus :: Offset -> Int -> Offset
@@ -45,7 +47,14 @@ plus (Offset w) i = Offset (w + fromIntegral i)
 
 data Ref = Ref !Segment !Ix
     deriving stock (Eq, Ord, Generic)
-    deriving anyclass Hashable
+    deriving anyclass (Hashable, Store)
+refPtrs :: Ptr Ref -> (Ptr Segment, Ptr Ix)
+refPtrs ptr = (castPtr ptr, castPtr ptr `plusPtr` 8)
+instance Storable Ref where
+    sizeOf _ = 16
+    alignment _ = 8
+    peek rp = let (sp,ip) = refPtrs rp in Ref <$> peek sp <*> peek ip
+    poke rp (Ref s i) = let (sp,ip) = refPtrs rp in poke sp s >> poke ip i
 
 newtype Flushed = Flushed (TMVar ())
 mark :: Flushed -> IO ()
@@ -166,12 +175,11 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
         (state', toDispatch) <- readerStep state enqueued
         case toDispatch of
             Nothing -> return ()
-            Just ref -> do
-                undefined
-                -- Fixme: Do something to load refs
-                -- forkIO $ do
-                --     -- bs <- readRef ref
-                --     atomically $ writeTBChan q (ReadComplete ref bs)
+            Just seg -> do
+                forkIO $ do
+                    bs <- openSeg seg
+                    offsets <- evaluate $ force $ loadOffsets bs
+                    atomically $ writeTBChan q (ReadComplete offsets seg bs)
                 return ()
         go state'
 
@@ -214,14 +222,17 @@ data Readers = Readers {shardShift :: Int,
 
 data ReadCache = ReadCache {
         readers :: Readers,
-        hotSegment :: Segment,
-        hot :: TVar (Map Offset ByteString)
+        -- Everyone has to read this for every read. Seems bad. But weak IORef MM causes issues
+        hot :: TVar (Segment,Map Offset ByteString)
     }
 
 data ConsumerLimits = ConsumerLimits {
         cutoffCount :: Int,
         cutoffLength :: Offset
     }
+
+
+-- gc :: Foldable f => (ByteString ->  Ref)
 
 data FinishedWith = Cutover | QueueDepleted
 
@@ -245,7 +256,7 @@ consume ConsumerLimits{..} cfg@ConsumerConfig{..} (WriteQueue q) = go initial
 data ConsumerConfig = ConsumerConfig {
         commandLog :: Handle,
         segment :: Segment,
-        sharedCache :: TVar (Map Offset ByteString) -- Cannot use IORef, on account of its weak memory model
+        register :: Map Offset ByteString -> IO () -- Should save in "hot" of ReadCache
     }
 
 data ConsumerState = ConsumerState {
@@ -265,11 +276,14 @@ consume' ConsumerConfig{..} state@ConsumerState{..} = \case
     Write refVar flushed bs -> do
         let entries' = Map.insert writeOffset bs entries
             writeOffset' = writeOffset `plus` ByteString.length bs
-            ix = Ix (length entries)
+            ix = Ix (fromIntegral $ length entries)
         ByteString.hPut commandLog bs
-        -- I'm pretty sure that putting these in separate "atomically" blocks still provides a strong MM w/o reordering
-        -- If it doesn't, this is wrong
-        atomically $ writeTVar sharedCache entries'
+        -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
+        -- We *must* make a globally visible update to the hot cache before returning the ref, or else
+        -- someone could try to do a read that would fail.
+        -- I *think* if we use STM vars to keep track of the hot cache and also to return the ref,
+        -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
+        register entries'
         atomically $ putTMVar refVar (Ref segment ix)
         return (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue})
 
