@@ -26,6 +26,7 @@ import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
+import           Streaming.Prelude (Stream, Of)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable)
@@ -134,6 +135,7 @@ insertSegment segment offsets bs cache@SegmentCache{..} =  SegmentCache open' de
     details' = case removed of
         Nothing -> Map.insert segment (offsets,bs) openSegmentDetails 
         Just (removed,()) -> Map.insert segment (offsets, bs) $ Map.delete removed openSegmentDetails 
+
 
 readSeg :: StoredOffsets -> ByteString -> Ix -> ByteString
 readSeg offs bs ix = value
@@ -280,6 +282,25 @@ data ConsumerState = ConsumerState {
         flushQueue :: [Flushed]
     }
 
+
+-- data Entry = Finalizer | BS ByteString
+-- data Finish = Interrupted | Finished ByteString
+-- stream :: 
+-- stream = go
+--     where
+--     go :: ByteString -> Stream (Of Entry) IO Finish
+--     go bs | ByteString.length bs < 8 = return Interrupted
+--           | len == maxBound = do
+--                 yield Finalizer 
+--                 go (ByteString.drop 8 bs)
+--           | ByteString.length bs < 8 + fromIntegral len = return Interrupted
+--           | otherwise = do
+--                 yield $ BS $ ByteString.take (fromIntegral len) $ ByteString.drop 8 bs
+--                 go (ByteString.drop (8 + fromIntegral len) bs)
+--         where
+--         len = (decodeEx $ ByteString.take 8 bs) :: Word64
+
+
 consume' :: ConsumerConfig -> ConsumerState -> WEnqueued -> IO ConsumerState
 consume' ConsumerConfig{..} state@ConsumerState{..} = \case
     Tick -> if null flushQueue
@@ -312,7 +333,9 @@ finalize ConsumerConfig{..} ConsumerState{..} = do
         storedOffsets = encode offsets
         offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
     ByteString.hPut commandLog $ encode (maxBound :: Word64)
+    ByteString.hPut commandLog $ encode offsetsLen
     ByteString.hPut commandLog storedOffsets
     ByteString.hPut commandLog $ encode offsetsLen
+    hFlush commandLog
 
 
