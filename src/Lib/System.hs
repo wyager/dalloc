@@ -197,12 +197,15 @@ readerStep state@ReaderState{..} = \case
         case Map.updateLookupWithKey remove seg pending of
             (Nothing, _) -> error "Pending read completed, but no one was waiting for it"
             (Just waiting, pending') -> do
-                let clear ix dones = 
+                let cache' = insertSegment seg offsets string segmentCache
+                    clear ix dones = 
                         let value = readSeg offsets string ix in 
                         mapM_ (\done -> atomically (putTMVar done value)) dones
                 Map.traverseWithKey clear waiting
-                return (state {pending = pending'}, Nothing)
-    SegmentWasGCed offsets seg new -> undefined
+                return (state {pending = pending', segmentCache = cache'}, Nothing)
+    SegmentWasGCed offsets seg new -> 
+        let cache' = updateSegment seg offsets new segmentCache in 
+        return (state {segmentCache = cache'}, Nothing)
 
 
 -- Sharded by segment hash
