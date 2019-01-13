@@ -1,6 +1,6 @@
 module Lib.System () where
 
-import           Data.Store (Store, encode) 
+import           Data.Store (Store, encode, decodeEx) 
 import           Control.Concurrent.Async (Async, async)
 import           Control.Concurrent (forkIO)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
@@ -11,7 +11,7 @@ import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, readTBMC
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
 import           Data.ByteString (ByteString)
 import           Control.Concurrent.STM (STM, atomically)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey)
+import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           System.IO (Handle, hFlush)
@@ -19,7 +19,7 @@ import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector as V
-import           Data.LruCache as Lru (LruCache, empty, insert, lookup)
+import           Data.LruCache as Lru (LruCache, empty, insert, lookup, insertView)
 import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 
@@ -35,6 +35,10 @@ newtype Offset = Offset Word64
 -- Add constructor for sparse offsets
 newtype StoredOffsets = OffsetVector (VS.Vector Offset)
     deriving newtype Store
+
+offset :: StoredOffsets -> Ix -> Offset
+offset (OffsetVector v) (Ix i) = v VS.! i
+
 
 plus :: Offset -> Int -> Offset
 plus (Offset w) i = Offset (w + fromIntegral i)
@@ -53,7 +57,8 @@ data WEnqueued = Write !(TMVar Ref) !Flushed !ByteString
 data WriteQueue = WriteQueue (TBMChan WEnqueued)
 
 data REnqueued = Read !Ref !(TMVar ByteString)
-               | ReadComplete !Ref !ByteString
+               | ReadComplete !StoredOffsets !Segment !ByteString
+               | SegmentWasGCed !StoredOffsets !Segment !ByteString -- The new segment (mmapped)
 
 data ReadQueue = ReadQueue (TBChan REnqueued)
 
@@ -67,60 +72,140 @@ write (WriteQueue q) value = async $ do
     return (ref, flushed)
 
 
-data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
+-- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
 data ReaderConfig = ReaderConfig {
-        readRef :: Ref -> IO ByteString,
-        lruSize :: Int
+        openSeg     :: Segment -> IO ByteString,
+        lruSize     :: Int,
+        maxOpenSegs :: Int
     }
 
--- We can have the reader cache StoredOffsets if it coordinates with GC to dump these when appropriate, 
--- which would let us avoid having to read StoredOffsets for every read on popular segments
--- Could also have a separate GC-state object which holds handles and StoredOffsets
+-- Holds all the open segment files (per shard)
+data SegmentCache = SegmentCache {
+    openSegments :: LruCache Segment (), 
+    openSegmentDetails :: Map Segment (StoredOffsets, ByteString) -- The ByteString is an mmapped view of the file
+}
+
+emptySegmentCache :: Int -> SegmentCache 
+emptySegmentCache max = SegmentCache {openSegments = Lru.empty max, openSegmentDetails = Map.empty}
+
+
+loadOffsets :: ByteString -> StoredOffsets
+loadOffsets bs | ByteString.length bs < 8 = error "Segment is too short to contain offset cache length tag"
+               | otherwise = 
+                    let last n = ByteString.drop (ByteString.length bs - n) bs in 
+                    let offsetLen = fromIntegral (decodeEx (last 8) :: Word64) in
+                    if | ByteString.length bs < 8 + offsetLen -> error "Segment is too short to contain purported offset cache"
+                       | otherwise -> let offsetsBs = ByteString.take offsetLen (last (offsetLen + 8)) in 
+                                      decodeEx offsetsBs :: StoredOffsets
+
+updateSegment :: Segment -> StoredOffsets -> ByteString -> SegmentCache -> SegmentCache
+updateSegment segment offsets new cache@SegmentCache{..} = 
+    cache {openSegmentDetails = Map.adjust (const (offsets, new)) segment openSegmentDetails}
+
+insertSegment :: Segment -> StoredOffsets -> ByteString -> SegmentCache -> SegmentCache
+insertSegment segment offsets bs cache@SegmentCache{..} =  SegmentCache open' details'
+    where
+    (removed,open') = Lru.insertView segment () openSegments 
+    details' = case removed of
+        Nothing -> Map.insert segment (offsets,bs) openSegmentDetails 
+        Just (removed,()) -> Map.insert segment (offsets, bs) $ Map.delete removed openSegmentDetails 
+
+readSeg :: StoredOffsets -> ByteString -> Ix -> ByteString
+readSeg offs bs ix = value
+    where
+    Offset theOffset = offset offs ix
+    len :: Word64 = decodeEx $ ByteString.take 8 $ ByteString.drop (fromIntegral theOffset) bs
+    value = ByteString.take (fromIntegral len) $ ByteString.drop (fromIntegral theOffset + 8) bs
+
+readSegCache :: SegmentCache -> Ref -> Maybe (ByteString, SegmentCache)
+readSegCache cache@SegmentCache{..} (Ref seg ix) = 
+    case Map.lookup seg openSegmentDetails of
+        Nothing -> Nothing
+        Just (offs,bs) -> Just (value, cache {openSegments = open'})
+            where
+            value = readSeg offs bs ix
+            open' = case Lru.lookup seg openSegments of
+                Just ((), new) -> new
+                Nothing -> error "A cache segment is present in the details map, but not the open segment LRU"
+
+
 data ReaderState = ReaderState {
     cached :: LruCache Ref ByteString,
-    pending :: Map Ref [TMVar ByteString]
+    segmentCache :: SegmentCache,
+    pending :: Map Segment (Map Ix [TMVar ByteString])
 }
+
+data Found a = NoK1 | NoK2 | Found a
+
+-- There's bound to be a good single-pass way of doing this, but it will take a bit to figure out
+appsert :: (Ord k1, Ord k2) => (Maybe a -> a) -> k1 -> k2  -> Map k1 (Map k2 a) -> (Map k1 (Map k2 a), Found a)
+appsert f k1 k2 m1 = (m1', found)
+    where
+    found = case Map.lookup k1 m1 of
+        Nothing -> NoK1
+        Just m2 -> case Map.lookup k2 m2 of
+            Nothing -> NoK2
+            Just a -> Found a
+    a' = case found of 
+        Found a -> f (Just a)
+        _ -> f Nothing
+    m1' = Map.alter g k1 m1
+    g Nothing = Just (Map.singleton k2 a')
+    g (Just m2) = Just (Map.insert k2 a' m2)
+
+
 
 
 reader :: ReaderConfig -> ReadQueue -> IO void
 reader ReaderConfig{..} (ReadQueue q) = go initial
     where
-    initial = ReaderState (Lru.empty lruSize) Map.empty
+    initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
     go state = do
         enqueued <- atomically $ readTBChan q
         (state', toDispatch) <- readerStep state enqueued
         case toDispatch of
             Nothing -> return ()
             Just ref -> do
-                forkIO $ do
-                    bs <- readRef ref
-                    atomically $ writeTBChan q (ReadComplete ref bs)
+                undefined
+                -- Fixme: Do something to load refs
+                -- forkIO $ do
+                --     -- bs <- readRef ref
+                --     atomically $ writeTBChan q (ReadComplete ref bs)
                 return ()
         go state'
 
 
-readerStep :: ReaderState -> REnqueued -> IO (ReaderState, Maybe Ref)
+readerStep :: ReaderState -> REnqueued -> IO (ReaderState, Maybe Segment)
 readerStep state@ReaderState{..} = \case
-    Read ref done -> case Lru.lookup ref cached of
-        Nothing -> 
-            let combine _k new old = new ++ old in
-            case Map.insertLookupWithKey combine ref [done] pending of
-                (Nothing, pending') -> return (state {pending = pending'}, Just ref)
-                (Just _waiting, pending') -> return (state {pending = pending'}, Nothing)
+    Read ref@(Ref seg ix) done -> case Lru.lookup ref cached of
         Just (string, cached') -> do
             atomically (putTMVar done string)
             return (state {cached = cached'}, Nothing)
-    ReadComplete ref string -> 
+        Nothing -> case readSegCache segmentCache ref of
+            Just (string, cache') -> do
+                atomically (putTMVar done string)
+                return (state {segmentCache = cache'}, Nothing)
+            Nothing -> 
+                let (pending', waiting) = appsert (maybe [done] (done:)) seg ix pending in
+                case waiting of
+                    NoK1    -> return (state {pending = pending'}, Just seg)
+                    NoK2    -> return (state {pending = pending'}, Nothing)
+                    Found _ -> return (state {pending = pending'}, Nothing)
+    ReadComplete offsets seg string -> 
         let remove _k _v = Nothing in
-        case Map.updateLookupWithKey remove ref pending of
+        case Map.updateLookupWithKey remove seg pending of
             (Nothing, _) -> error "Pending read completed, but no one was waiting for it"
             (Just waiting, pending') -> do
-                mapM_ (\done -> atomically (putTMVar done string)) waiting
+                let clear ix dones = 
+                        let value = readSeg offsets string ix in 
+                        mapM_ (\done -> atomically (putTMVar done value)) dones
+                Map.traverseWithKey clear waiting
                 return (state {pending = pending'}, Nothing)
+    SegmentWasGCed offsets seg new -> undefined
 
 
--- Sharded by segment hash (could use ref hash, I suppose, but probably removes optimization opportunities)
+-- Sharded by segment hash
 data Readers = Readers {shardShift :: Int, 
                         shards :: V.Vector ReadQueue}
 
@@ -150,7 +235,7 @@ consume ConsumerLimits{..} cfg@ConsumerConfig{..} (WriteQueue q) = go initial
         state' <- consume' cfg state enqueued
         -- We put the finalizer check here instead of on the LHS of go
         -- so that we always make progress, even if settings are too restrictive
-        if offset state' >= cutoffLength || length (entries state) >= cutoffCount
+        if writeOffset state' >= cutoffLength || length (entries state) >= cutoffCount
             then finalize cfg state' >> return Cutover
             else go state'
 
@@ -162,7 +247,7 @@ data ConsumerConfig = ConsumerConfig {
 
 data ConsumerState = ConsumerState {
         entries :: Map Offset ByteString,
-        offset :: Offset,
+        writeOffset :: Offset,
         flushQueue :: [Flushed]
     }
 
@@ -175,15 +260,15 @@ consume' ConsumerConfig{..} state@ConsumerState{..} = \case
             mapM_ mark flushQueue
             return (state {flushQueue = []})
     Write refVar flushed bs -> do
-        let entries' = Map.insert offset bs entries
-            offset' = offset `plus` ByteString.length bs
+        let entries' = Map.insert writeOffset bs entries
+            writeOffset' = writeOffset `plus` ByteString.length bs
             ix = Ix (length entries)
         ByteString.hPut commandLog bs
         -- I'm pretty sure that putting these in separate "atomically" blocks still provides a strong MM w/o reordering
         -- If it doesn't, this is wrong
         atomically $ writeTVar sharedCache entries'
         atomically $ putTMVar refVar (Ref segment ix)
-        return (state {entries = entries', offset = offset', flushQueue = flushed : flushQueue})
+        return (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue})
 
 
 

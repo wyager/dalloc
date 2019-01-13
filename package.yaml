@@ -74,6 +74,7 @@ library:
   - stm-chans
   - lrucaching
   - hashable
+  - mmap
   ghc-options:
   - -O2
   - -Wall
