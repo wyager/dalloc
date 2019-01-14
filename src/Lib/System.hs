@@ -26,7 +26,7 @@ import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
-import           Streaming.Prelude (Stream, Of)
+import           Streaming.Prelude (Stream, Of, yield)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable)
@@ -283,6 +283,32 @@ data ConsumerState = ConsumerState {
     }
 
 
+data Step = Incomplete | Finalizer ByteString | Packet ByteString ByteString
+step :: ByteString -> Step
+step bs = if | totalLen < 8 -> Incomplete
+             | packetLen == maxBound -> Finalizer afterLen
+             | ByteString.length bs < 8 + packetLen' -> Incomplete
+             | otherwise -> Packet packet remainder
+        where
+        totalLen = ByteString.length bs
+        packetLen :: Word64 = decodeEx $ ByteString.take 8 bs
+        packetLen' :: Int = fromIntegral packetLen
+        afterLen = ByteString.drop 8 bs
+        (packet,remainder) = ByteString.splitAt packetLen' afterLen
+
+stream :: ByteString -> Stream (Of ByteString) IO (Maybe ByteString)
+stream = go
+    where
+    go bs = case step bs of
+        Incomplete -> return Nothing
+        Finalizer next -> case step next of
+            Packet bs _ -> return (Just bs)
+            Incomplete -> return Nothing
+            Finalizer _ -> error "Repeated finalizer"
+        Packet packet next -> do
+            yield packet
+            go next
+
 -- data Entry = Finalizer | BS ByteString
 -- data Finish = Interrupted | Finished ByteString
 -- stream :: 
@@ -334,7 +360,7 @@ finalize ConsumerConfig{..} ConsumerState{..} = do
         offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
     ByteString.hPut commandLog $ encode (maxBound :: Word64)
     ByteString.hPut commandLog $ encode offsetsLen
-    ByteString.hPut commandLog storedOffsets
+    ByteString.hPut commandLog storedOffsets -- length on either side so we can read from the end of file or in
     ByteString.hPut commandLog $ encode offsetsLen
     hFlush commandLog
 
