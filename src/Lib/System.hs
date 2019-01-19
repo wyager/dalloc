@@ -86,11 +86,13 @@ data WEnqueued flushed ref
     = Write !ref !flushed !ByteString
     | Tick
 
+data MMapped = MMapped !StoredOffsets !ByteString
+
 data WriteQueue = WriteQueue (TBMChan (WEnqueued Flushed (TMVar Ref)))
 
 data REnqueued = Read !Ref !(TMVar ByteString)
-               | ReadComplete !StoredOffsets !Segment !ByteString
-               | SegmentWasGCed !StoredOffsets !Segment !ByteString -- The new segment (mmapped)
+               | ReadComplete !Segment !MMapped
+               | SegmentWasGCed !Segment !MMapped -- The new segment (mmapped)
 
 data ReadQueue = ReadQueue (TBChan REnqueued)
 
@@ -115,7 +117,7 @@ data ReaderConfig = ReaderConfig {
 -- Holds all the open segment files (per shard)
 data SegmentCache = SegmentCache {
     openSegments :: LruCache Segment (), 
-    openSegmentDetails :: Map Segment (StoredOffsets, ByteString) -- The ByteString is an mmapped view of the file
+    openSegmentDetails :: Map Segment MMapped -- The ByteString is an mmapped view of the file
 }
 
 emptySegmentCache :: Int -> SegmentCache 
@@ -131,22 +133,22 @@ loadOffsets bs | ByteString.length bs < 8 = error "Segment is too short to conta
                        | otherwise -> let offsetsBs = ByteString.take offsetLen (last (offsetLen + 8)) in 
                                       decodeEx offsetsBs :: StoredOffsets
 
-updateSegment :: Segment -> StoredOffsets -> ByteString -> SegmentCache -> SegmentCache
-updateSegment segment offsets new cache@SegmentCache{..} = 
-    cache {openSegmentDetails = Map.adjust (const (offsets, new)) segment openSegmentDetails}
+updateSegment :: Segment -> MMapped -> SegmentCache -> SegmentCache
+updateSegment segment mmapped cache@SegmentCache{..} = 
+    cache {openSegmentDetails = Map.adjust (const mmapped) segment openSegmentDetails}
 
-insertSegment :: Segment -> StoredOffsets -> ByteString -> SegmentCache -> SegmentCache
-insertSegment segment offsets bs cache@SegmentCache{..} =  SegmentCache open' details'
+insertSegment :: Segment -> MMapped -> SegmentCache -> SegmentCache
+insertSegment segment mmapped cache@SegmentCache{..} =  SegmentCache open' details'
     where
     (removed,open') = Lru.insertView segment () openSegments 
     details' = case removed of
-        Nothing -> Map.insert segment (offsets,bs) openSegmentDetails 
-        Just (removed,()) -> Map.insert segment (offsets, bs) $ Map.delete removed openSegmentDetails 
+        Nothing -> Map.insert segment mmapped openSegmentDetails 
+        Just (removed,()) -> Map.insert segment mmapped $ Map.delete removed openSegmentDetails 
 
 
 data Order = Asc | Desc
-streamSegFromOffsets :: Monad m => Order -> StoredOffsets -> ByteString -> Stream (Of (Ix, ByteString)) m ()
-streamSegFromOffsets order stored bs = mapM_ (\(ix,off) -> yield (ix, readOff bs off)) offsets
+streamSegFromOffsets :: Monad m => Order -> MMapped -> Stream (Of (Ix, ByteString)) m ()
+streamSegFromOffsets order (MMapped stored bs) = mapM_ (\(ix,off) -> yield (ix, readOff bs off)) offsets
     where 
     offsets = case order of
         Asc -> inorder
@@ -163,8 +165,8 @@ readOff bs (Offset theOffset) = value
     len :: Word64 = decodeEx $ ByteString.take 8 $ ByteString.drop (fromIntegral theOffset) bs
     value = ByteString.take (fromIntegral len) $ ByteString.drop (fromIntegral theOffset + 8) bs
 
-readSeg :: StoredOffsets -> ByteString -> Ix -> ByteString
-readSeg offs bs ix = readOff bs (offset offs ix) 
+readSeg :: MMapped-> Ix -> ByteString
+readSeg (MMapped offs bs) ix = readOff bs (offset offs ix) 
 
     
 
@@ -172,9 +174,9 @@ readSegCache :: SegmentCache -> Ref -> Maybe (ByteString, SegmentCache)
 readSegCache cache@SegmentCache{..} (Ref seg ix) = 
     case Map.lookup seg openSegmentDetails of
         Nothing -> Nothing
-        Just (offs,bs) -> Just (value, cache {openSegments = open'})
+        Just mmapped -> Just (value, cache {openSegments = open'})
             where
-            value = readSeg offs bs ix
+            value = readSeg mmapped ix
             open' = case Lru.lookup seg openSegments of
                 Just ((), new) -> new
                 Nothing -> error "A cache segment is present in the details map, but not the open segment LRU"
@@ -217,7 +219,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
                 forkIO $ do
                     bs <- openSeg seg
                     offsets <- evaluate $ force $ loadOffsets bs
-                    atomically $ writeTBChan q (ReadComplete offsets seg bs)
+                    atomically $ writeTBChan q (ReadComplete seg $ MMapped offsets bs)
                 return ()
         go state'
 
@@ -238,19 +240,19 @@ readerStep state@ReaderState{..} = \case
                     NoK1    -> return (state {pending = pending'}, Just seg)
                     NoK2    -> return (state {pending = pending'}, Nothing)
                     Found _ -> return (state {pending = pending'}, Nothing)
-    ReadComplete offsets seg string -> 
+    ReadComplete  seg mmapped -> 
         let remove _k _v = Nothing in
         case Map.updateLookupWithKey remove seg pending of
             (Nothing, _) -> error "Pending read completed, but no one was waiting for it"
             (Just waiting, pending') -> do
-                let cache' = insertSegment seg offsets string segmentCache
+                let cache' = insertSegment seg mmapped segmentCache
                     clear ix dones = 
-                        let value = readSeg offsets string ix in 
+                        let value = readSeg mmapped ix in 
                         mapM_ (\done -> atomically (putTMVar done value)) dones
                 Map.traverseWithKey clear waiting
                 return (state {pending = pending', segmentCache = cache'}, Nothing)
-    SegmentWasGCed offsets seg new -> 
-        let cache' = updateSegment seg offsets new segmentCache in 
+    SegmentWasGCed seg mmapped -> 
+        let cache' = updateSegment seg mmapped segmentCache in 
         return (state {segmentCache = cache'}, Nothing)
 
 
