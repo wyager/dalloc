@@ -274,7 +274,6 @@ data ConsumerLimits = ConsumerLimits {
 exceeds :: (Int, Offset) -> ConsumerLimits -> Bool
 (count,len) `exceeds` ConsumerLimits{..} = count >= cutoffCount || len >= cutoffLength
 
-
 splitWith :: Monad m
           => ConsumerLimits 
           -> Stream (Of (WEnqueued flushed ref)) m a 
@@ -283,8 +282,6 @@ splitWith :: Monad m
 splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits) 
     where
     throughput (count,len) (Write _ _ bs) = (count + 1, len `plus` ByteString.length bs)
-
-
 
 
 consume :: Monad m
@@ -300,10 +297,6 @@ consume handle finalize = foldM step initial finalize
         return state'
 
 
--- todo: We need to play the file in reverse order in order to GC.
-
-
-
 
 data GcConfig entry = GcConfig {
     thisSegment :: Segment,
@@ -314,6 +307,8 @@ data GcState = GcState {
     liveHere :: Set Ix,
     liveThere :: Set Ref
 }
+
+
 
 
 gc :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
@@ -332,6 +327,9 @@ gc GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . li
             | seg == thisSegment && ix >= thisIx = error "Index causality violation"
             | seg == thisSegment = s {liveHere = Set.insert ix liveHere}
             | otherwise = s {liveThere = Set.insert ref liveThere}
+
+repackFile :: Handle -> Stream (Of (Ix, ByteString)) IO r -> IO r
+repackFile = undefined -- Save entries, then save the stored offsets
 
 data ConsumerConfig = ConsumerConfig {
         commandLog :: Handle,
@@ -371,8 +369,6 @@ stream = go
         Packet packet next -> do
             yield packet
             go next
-
-
 
 
 data ConsumerAction flushed ref = Flush [flushed] | WriteToLog ByteString (Map Offset ByteString) ref Ix | Nop
