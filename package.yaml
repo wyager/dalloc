@@ -75,6 +75,7 @@ library:
   - lrucaching
   - hashable
   - mmap
+  - mmorph
   ghc-options:
   - -O2
   - -Wall

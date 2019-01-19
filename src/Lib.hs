@@ -1,4 +1,4 @@
-module Lib where
+module Lib () where
 
 import Data.Word (Word64)
 import Data.ByteString (ByteString)

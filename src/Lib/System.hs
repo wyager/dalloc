@@ -1,4 +1,4 @@
-module Lib.System () where
+module Lib.System  where
 
 import           Data.Store (Store, encode, decodeEx) 
 import           Control.Concurrent.Async (Async, async)
@@ -12,6 +12,7 @@ import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
 import           Data.ByteString (ByteString)
 import           Control.Concurrent.STM (STM, atomically)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
+import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           System.IO (Handle, hFlush)
@@ -28,15 +29,17 @@ import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
 import           Streaming.Prelude (Stream, Of, yield, breakWhen, foldM)
 import           Data.Monoid (Sum(..))
+import           Control.Monad.Trans.Class (lift)
+import           Control.Monad.Morph (hoist)
 
 newtype Segment = Segment Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
 
 newtype Ix = Ix Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
 
 newtype Offset = Offset Word64 
-    deriving newtype (Eq, Ord, Store, Storable, Num)
+    deriving newtype (Eq, Ord, Store, Storable, Num, Show)
 
 data Assoc = Assoc !Ix !Offset
 
@@ -62,8 +65,8 @@ offset (OffsetVector v) (Ix i) = v VS.! (fromIntegral i)
 plus :: Offset -> Int -> Offset
 plus (Offset w) i = Offset (w + fromIntegral i)
 
-data Ref = Ref !Segment !Ix
-    deriving stock (Eq, Ord, Generic)
+data Ref = Ref {refSegment :: !Segment, refIx :: !Ix}
+    deriving stock (Eq, Ord, Generic, Show)
     deriving anyclass (Hashable, Store)
 refPtrs :: Ptr Ref -> (Ptr Segment, Ptr Ix)
 refPtrs ptr = (castPtr ptr, castPtr ptr `plusPtr` 8)
@@ -263,7 +266,6 @@ splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits)
 
 
 
-
 consume :: Monad m
         => (ConsumerAction flushed ref -> m ()) 
         -> (ConsumerState flushed -> m o)
@@ -281,6 +283,33 @@ consume handle finalize = foldM step initial finalize
 -- gc :: (ByteString -> VS.Vector Ref) -> (Ref -> Bool) -> StoredOffsets -> ByteString -> (ByteString -> m ())
 
 
+data GcConfig entry = GcConfig {
+    thisSegment :: Segment,
+    childrenOf :: entry -> VS.Vector Ref
+}
+
+data GcState = GcState {
+    liveHere :: Set Ix,
+    liveThere :: Set Ref
+}
+
+
+gc :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
+gc GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . liveThere) . hoist lift
+    where
+    step state (ix,bs) = if ix `Set.member` (liveHere state)
+                            then do
+                                yield (ix,bs)
+                                return (step' state ix bs)
+                            else return state
+    step' state thisIx bs = VS.foldl' step state children
+        where
+        children = childrenOf bs
+        step s@GcState{..} ref@(Ref seg ix)
+            | seg > thisSegment = error "Segment causality violation"
+            | seg == thisSegment && ix >= thisIx = error "Index causality violation"
+            | seg == thisSegment = s {liveHere = Set.insert ix liveHere}
+            | otherwise = s {liveThere = Set.insert ref liveThere}
 
 
 
