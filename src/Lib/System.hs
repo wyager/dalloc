@@ -62,6 +62,8 @@ offset :: StoredOffsets -> Ix -> Offset
 offset (OffsetVector v) (Ix i) = v VS.! (fromIntegral i)
 
 
+
+
 plus :: Offset -> Int -> Offset
 plus (Offset w) i = Offset (w + fromIntegral i)
 
@@ -142,12 +144,29 @@ insertSegment segment offsets bs cache@SegmentCache{..} =  SegmentCache open' de
         Just (removed,()) -> Map.insert segment (offsets, bs) $ Map.delete removed openSegmentDetails 
 
 
-readSeg :: StoredOffsets -> ByteString -> Ix -> ByteString
-readSeg offs bs ix = value
+data Order = Asc | Desc
+streamSegFromOffsets :: Monad m => Order -> StoredOffsets -> ByteString -> Stream (Of (Ix, ByteString)) m ()
+streamSegFromOffsets order stored bs = mapM_ (\(ix,off) -> yield (ix, readOff bs off)) offsets
+    where 
+    offsets = case order of
+        Asc -> inorder
+        Desc -> reverse inorder -- Can optimize this whole thing to remove list, if needed
+    inorder = case stored of
+        OffsetVector v ->  zip (fmap Ix [0..]) (VS.toList v)
+        SparseVector v -> fmap (\(Assoc ix off) -> (ix,off)) $ VS.toList v
+
+
+
+readOff :: ByteString -> Offset ->  ByteString
+readOff bs (Offset theOffset) = value
     where
-    Offset theOffset = offset offs ix
     len :: Word64 = decodeEx $ ByteString.take 8 $ ByteString.drop (fromIntegral theOffset) bs
     value = ByteString.take (fromIntegral len) $ ByteString.drop (fromIntegral theOffset + 8) bs
+
+readSeg :: StoredOffsets -> ByteString -> Ix -> ByteString
+readSeg offs bs ix = readOff bs (offset offs ix) 
+
+    
 
 readSegCache :: SegmentCache -> Ref -> Maybe (ByteString, SegmentCache)
 readSegCache cache@SegmentCache{..} (Ref seg ix) = 
@@ -279,8 +298,9 @@ consume handle finalize = foldM step initial finalize
         return state'
 
 
--- todo: Lift out some of the logic from the consumer to reuse here
--- gc :: (ByteString -> VS.Vector Ref) -> (Ref -> Bool) -> StoredOffsets -> ByteString -> (ByteString -> m ())
+-- todo: We need to play the file in reverse order in order to GC.
+
+
 
 
 data GcConfig entry = GcConfig {
@@ -310,8 +330,6 @@ gc GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . li
             | seg == thisSegment && ix >= thisIx = error "Index causality violation"
             | seg == thisSegment = s {liveHere = Set.insert ix liveHere}
             | otherwise = s {liveThere = Set.insert ref liveThere}
-
-
 
 data ConsumerConfig = ConsumerConfig {
         commandLog :: Handle,
