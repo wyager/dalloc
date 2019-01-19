@@ -26,7 +26,8 @@ import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
-import           Streaming.Prelude (Stream, Of, yield)
+import           Streaming.Prelude (Stream, Of, yield, breakWhen, foldM)
+import           Data.Monoid (Sum(..))
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable)
@@ -35,7 +36,7 @@ newtype Ix = Ix Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable)
 
 newtype Offset = Offset Word64 
-    deriving newtype (Eq, Ord, Store, Storable)
+    deriving newtype (Eq, Ord, Store, Storable, Num)
 
 data Assoc = Assoc !Ix !Offset
 
@@ -76,10 +77,11 @@ newtype Flushed = Flushed (TMVar ())
 mark :: Flushed -> IO ()
 mark (Flushed mvar) = atomically $ putTMVar mvar ()
 
-data WEnqueued = Write !(TMVar Ref) !Flushed !ByteString
-               | Tick
+data WEnqueued flushed ref
+    = Write !ref !flushed !ByteString
+    | Tick
 
-data WriteQueue = WriteQueue (TBMChan WEnqueued)
+data WriteQueue = WriteQueue (TBMChan (WEnqueued Flushed (TMVar Ref)))
 
 data REnqueued = Read !Ref !(TMVar ByteString)
                | ReadComplete !StoredOffsets !Segment !ByteString
@@ -166,19 +168,16 @@ data Found a = NoK1 | NoK2 | Found a
 
 -- There's bound to be a good single-pass way of doing this, but it will take a bit to figure out
 appsert :: (Ord k1, Ord k2) => (Maybe a -> a) -> k1 -> k2  -> Map k1 (Map k2 a) -> (Map k1 (Map k2 a), Found a)
-appsert f k1 k2 m1 = (m1', found)
+appsert f k1 k2 map = (map', found)
     where
-    found = case Map.lookup k1 m1 of
-        Nothing -> NoK1
-        Just m2 -> case Map.lookup k2 m2 of
-            Nothing -> NoK2
-            Just a -> Found a
+    find = maybe NoK1 (maybe NoK2 Found . Map.lookup k2) . Map.lookup k1
+    found = find map
     a' = case found of 
         Found a -> f (Just a)
         _ -> f Nothing
-    m1' = Map.alter g k1 m1
+    map' = Map.alter g k1 map
     g Nothing = Just (Map.singleton k2 a')
-    g (Just m2) = Just (Map.insert k2 a' m2)
+    g (Just inner) = Just (Map.insert k2 a' inner)
 
 
 
@@ -248,27 +247,42 @@ data ConsumerLimits = ConsumerLimits {
         cutoffLength :: Offset
     }
 
+exceeds :: (Int, Offset) -> ConsumerLimits -> Bool
+(count,len) `exceeds` ConsumerLimits{..} = count >= cutoffCount || len >= cutoffLength
+
+
+splitWith :: Monad m
+          => ConsumerLimits 
+          -> Stream (Of (WEnqueued flushed ref)) m a 
+          -> Stream (Of (WEnqueued flushed ref)) m 
+           ((Stream (Of (WEnqueued flushed ref)) m a))
+splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits) 
+    where
+    throughput (count,len) (Write _ _ bs) = (count + 1, len `plus` ByteString.length bs)
+
+
+
+
+
+consume :: Monad m
+        => (ConsumerAction flushed ref -> m ()) 
+        -> (ConsumerState flushed -> m o)
+        -> Stream (Of (WEnqueued flushed ref)) m r -> m (Of o r)
+consume handle finalize = foldM step initial finalize
+    where
+    initial = return (ConsumerState Map.empty (Offset 0) [])
+    step state write = do
+        let (state', action) = consume' state write
+        handle action
+        return state'
+
+
 -- todo: Lift out some of the logic from the consumer to reuse here
 -- gc :: (ByteString -> VS.Vector Ref) -> (Ref -> Bool) -> StoredOffsets -> ByteString -> (ByteString -> m ())
 
-data FinishedWith = Cutover | QueueDepleted
 
-consume :: ConsumerLimits -> ConsumerConfig -> WriteQueue -> IO FinishedWith
-consume ConsumerLimits{..} cfg@ConsumerConfig{..} (WriteQueue q) = go initial
-    where
-    initial = ConsumerState Map.empty (Offset 0) []
-    go state = do
-            enqueued <- atomically $ readTBMChan q
-            case enqueued of
-                Nothing -> return QueueDepleted
-                Just item -> step state item
-    step state enqueued = do
-        state' <- consume' cfg state enqueued
-        -- We put the finalizer check here instead of on the LHS of go
-        -- so that we always make progress, even if settings are too restrictive
-        if writeOffset state' >= cutoffLength || length (entries state) >= cutoffCount
-            then finalize cfg state' >> return Cutover
-            else go state'
+
+
 
 data ConsumerConfig = ConsumerConfig {
         commandLog :: Handle,
@@ -276,10 +290,10 @@ data ConsumerConfig = ConsumerConfig {
         register :: Map Offset ByteString -> IO () -- Should save in "hot" of ReadCache
     }
 
-data ConsumerState = ConsumerState {
+data ConsumerState flushed = ConsumerState {
         entries :: Map Offset ByteString,
         writeOffset :: Offset,
-        flushQueue :: [Flushed]
+        flushQueue :: [flushed]
     }
 
 
@@ -296,7 +310,7 @@ step bs = if | totalLen < 8 -> Incomplete
         afterLen = ByteString.drop 8 bs
         (packet,remainder) = ByteString.splitAt packetLen' afterLen
 
-stream :: ByteString -> Stream (Of ByteString) IO (Maybe ByteString)
+stream :: Monad m => ByteString -> Stream (Of ByteString) m (Maybe ByteString)
 stream = go
     where
     go bs = case step bs of
@@ -309,50 +323,46 @@ stream = go
             yield packet
             go next
 
--- data Entry = Finalizer | BS ByteString
--- data Finish = Interrupted | Finished ByteString
--- stream :: 
--- stream = go
---     where
---     go :: ByteString -> Stream (Of Entry) IO Finish
---     go bs | ByteString.length bs < 8 = return Interrupted
---           | len == maxBound = do
---                 yield Finalizer 
---                 go (ByteString.drop 8 bs)
---           | ByteString.length bs < 8 + fromIntegral len = return Interrupted
---           | otherwise = do
---                 yield $ BS $ ByteString.take (fromIntegral len) $ ByteString.drop 8 bs
---                 go (ByteString.drop (8 + fromIntegral len) bs)
---         where
---         len = (decodeEx $ ByteString.take 8 bs) :: Word64
 
 
-consume' :: ConsumerConfig -> ConsumerState -> WEnqueued -> IO ConsumerState
-consume' ConsumerConfig{..} state@ConsumerState{..} = \case
+
+data ConsumerAction flushed ref = Flush [flushed] | WriteToLog ByteString (Map Offset ByteString) ref Ix | Nop
+
+
+
+consume' :: ConsumerState flushed -> WEnqueued flushed ref -> (ConsumerState flushed, ConsumerAction flushed ref)
+consume' state@ConsumerState{..} = \case
     Tick -> if null flushQueue
-        then return state 
-        else do
-            hFlush commandLog
-            mapM_ mark flushQueue
-            return (state {flushQueue = []})
+        then (state, Nop)
+        else (state {flushQueue = []}, Flush flushQueue)
     Write refVar flushed bs -> do
         let entries' = Map.insert writeOffset bs entries
             writeOffset' = writeOffset `plus` ByteString.length bs
             ix = Ix (fromIntegral $ length entries)
-        ByteString.hPut commandLog bs
-        -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
-        -- We *must* make a globally visible update to the hot cache before returning the ref, or else
-        -- someone could try to do a read that would fail.
-        -- I *think* if we use STM vars to keep track of the hot cache and also to return the ref,
-        -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
-        register entries'
-        atomically $ putTMVar refVar (Ref segment ix)
-        return (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue})
+        (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue},
+            WriteToLog bs entries' refVar ix)
 
 
+consumeFile :: ConsumerConfig -> Stream (Of (WEnqueued Flushed (TMVar Ref))) IO r -> IO (Of () r)
+consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
-finalize :: ConsumerConfig -> ConsumerState -> IO ()
-finalize ConsumerConfig{..} ConsumerState{..} = do
+saveFile :: ConsumerConfig -> ConsumerAction Flushed (TMVar Ref) -> IO ()
+saveFile ConsumerConfig{..} = \case
+        Flush flushed -> do
+            hFlush commandLog
+            mapM_ mark flushed
+        WriteToLog bs entries refVar ix -> do
+            ByteString.hPut commandLog bs
+            -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
+            -- We *must* make a globally visible update to the hot cache before returning the ref, or else
+            -- someone could try to do a read that would fail.
+            -- I *think* if we use STM vars to keep track of the hot cache and also to return the ref,
+            -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
+            register entries
+            atomically $ putTMVar refVar (Ref segment ix) 
+
+finalizeFile :: ConsumerConfig -> ConsumerState Flushed -> IO ()
+finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     hFlush commandLog
     mapM_ mark flushQueue
     let offsets = OffsetVector (VS.fromList (keys entries))
@@ -360,7 +370,7 @@ finalize ConsumerConfig{..} ConsumerState{..} = do
         offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
     ByteString.hPut commandLog $ encode (maxBound :: Word64)
     ByteString.hPut commandLog $ encode offsetsLen
-    ByteString.hPut commandLog storedOffsets -- length on either side so we can read from the end of file or in
+    ByteString.hPut commandLog storedOffsets -- length on either side so we can read from the end of file or in order
     ByteString.hPut commandLog $ encode offsetsLen
     hFlush commandLog
 
