@@ -271,6 +271,11 @@ readerStep state@ReaderState{..} = \case
         return (state {segmentCache = cache'}, Nothing)
 
 
+data GcState = GcState {
+        roots :: Set Ref,
+        persistent :: Ref
+    }
+
 -- Sharded by segment hash
 data Readers = Readers {shardShift :: Int, 
                         shards :: V.Vector ReadQueue}
@@ -318,7 +323,7 @@ data GcConfig entry = GcConfig {
     childrenOf :: entry -> VS.Vector Ref
 }
 
-data GcState = GcState {
+data SegGcState = SegGcState {
     liveHere :: Set Ix,
     liveThere :: Set Ref
 }
@@ -331,7 +336,7 @@ gc cfg live newFile = fmap unwrap . repackFile newFile . gc' cfg live . streamSe
 
 
 gc' :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
-gc' GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . liveThere) . hoist lift
+gc' GcConfig{..} here = foldM step (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
     where
     step state (ix,bs) = if ix `Set.member` (liveHere state)
                             then do
@@ -341,7 +346,7 @@ gc' GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . l
     step' state thisIx bs = VS.foldl' step state children
         where
         children = childrenOf bs
-        step s@GcState{..} ref@(Ref seg ix)
+        step s@SegGcState{..} ref@(Ref seg ix)
             | seg > thisSegment = error "Segment causality violation"
             | seg == thisSegment && ix >= thisIx = error "Index causality violation"
             | seg == thisSegment = s {liveHere = Set.insert ix liveHere}
