@@ -17,6 +17,7 @@ import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           System.IO (Handle, hFlush)
 import           System.IO.MMap (mmapFileByteString)
+import           System.Directory (doesFileExist)
 import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
@@ -34,6 +35,7 @@ import           Data.Monoid (Sum(..))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (hoist)
 import           Numeric.Search.Range (searchFromTo)
+import           Numeric.Search (searchM, divForever, hiVal)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
@@ -270,6 +272,35 @@ readerStep state@ReaderState{..} = \case
         let cache' = updateSegment seg mmapped segmentCache in 
         return (state {segmentCache = cache'}, Nothing)
 
+data FilenameConfig = FilenameConfig {
+        segmentPath :: Segment -> FilePath,
+        partialSegmentPath :: Segment -> FilePath
+    }
+
+
+data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment
+
+initialize :: FilenameConfig -> IO InitResult
+initialize FilenameConfig{..} = do
+    let searchRanges = ([0], take 64 $ iterate (*2) 1)
+        pred ix = not <$> doesFileExist (segmentPath (Segment ix))
+    searchM searchRanges divForever pred >>= \case
+        [trivial] -> doesFileExist (partialSegmentPath (Segment 0)) >>= \case
+            True -> return $ AbruptShutdown (Segment 0)
+            False -> return $ NoData
+        [exists,_] -> do
+            let highestExists = hiVal exists
+            doesFileExist (partialSegmentPath (Segment (highestExists + 1))) >>= \case
+                True -> return $ AbruptShutdown (Segment (highestExists + 1))
+                False -> return $ CleanShutdown (Segment highestExists)
+
+
+
+
+data CoreState = CoreState {
+        coreCollector :: TVar GcState,
+        coreReaders :: ReadCache
+    }
 
 data GcState = GcState {
         roots :: Set Ref,

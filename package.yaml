@@ -76,6 +76,7 @@ library:
   - hashable
   - mmap
   - mmorph
+  - directory
   ghc-options:
   - -O2
   - -Wall
