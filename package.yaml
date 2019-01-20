@@ -99,6 +99,7 @@ executables:
     - cereal
     - containers
     - streaming
+    - binary-search
 
 tests:
   dalloc-test:

@@ -11,11 +11,12 @@ import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, readTBMC
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
 import           Data.ByteString (ByteString)
 import           Control.Concurrent.STM (STM, atomically)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
+import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           System.IO (Handle, hFlush)
+import           System.IO.MMap (mmapFileByteString)
 import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
@@ -27,10 +28,12 @@ import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
-import           Streaming.Prelude (Stream, Of, yield, breakWhen, foldM)
+import           Streaming.Prelude (Stream, yield, breakWhen, foldM)
+import           Data.Functor.Of (Of((:>)))
 import           Data.Monoid (Sum(..))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (hoist)
+import           Numeric.Search.Range (searchFromTo)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
@@ -60,8 +63,13 @@ data StoredOffsets = OffsetVector (VS.Vector Offset)
 
 offset :: StoredOffsets -> Ix -> Offset
 offset (OffsetVector v) (Ix i) = v VS.! (fromIntegral i)
-
-
+offset (SparseVector v) i = 
+    case searchFromTo geq 0 (VS.length v - 1) of
+        Just j | Assoc i' o <- v VS.! j,
+                 i' == i -> o
+        _ -> error "Index not found in stored offsets"
+    where
+    geq j = let Assoc i' _o = (v VS.! j) in i' >= i
 
 
 plus :: Offset -> Int -> Offset
@@ -106,6 +114,13 @@ write (WriteQueue q) value = async $ do
     return (ref, flushed)
 
 
+mmap :: FilePath -> IO MMapped
+mmap path = do
+    bs <- mmapFileByteString path Nothing
+    let offs = loadOffsets bs
+    return (MMapped offs bs)
+
+
 -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
 data ReaderConfig = ReaderConfig {
@@ -117,7 +132,7 @@ data ReaderConfig = ReaderConfig {
 -- Holds all the open segment files (per shard)
 data SegmentCache = SegmentCache {
     openSegments :: LruCache Segment (), 
-    openSegmentDetails :: Map Segment MMapped -- The ByteString is an mmapped view of the file
+    openSegmentDetails :: Map Segment MMapped
 }
 
 emptySegmentCache :: Int -> SegmentCache 
@@ -309,10 +324,14 @@ data GcState = GcState {
 }
 
 
+gc :: GcConfig ByteString -> Set Ix -> Handle -> MMapped -> IO (StoredOffsets, Set Ref)
+gc cfg live newFile = fmap unwrap . repackFile newFile . gc' cfg live . streamSegFromOffsets Desc
+    where unwrap (offs :> live :> ()) = (offs, live)
 
 
-gc :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
-gc GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . liveThere) . hoist lift
+
+gc' :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
+gc' GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . liveThere) . hoist lift
     where
     step state (ix,bs) = if ix `Set.member` (liveHere state)
                             then do
@@ -328,8 +347,25 @@ gc GcConfig{..} here = foldM step (return (GcState here Set.empty)) (return . li
             | seg == thisSegment = s {liveHere = Set.insert ix liveHere}
             | otherwise = s {liveThere = Set.insert ref liveThere}
 
-repackFile :: Handle -> Stream (Of (Ix, ByteString)) IO r -> IO r
-repackFile = undefined -- Save entries, then save the stored offsets
+
+data RepackState = RepackState {
+        repackOffset :: Offset,
+        repackMap :: Map Ix Offset
+    }
+
+repackFile :: Handle -> Stream (Of (Ix, ByteString)) IO r -> IO (Of StoredOffsets r)
+repackFile hdl = foldM step (return initial) finalize
+    where
+    step RepackState{..} (ix,bs) = do
+        ByteString.hPut hdl bs
+        return (RepackState {repackOffset = repackOffset `plus` ByteString.length bs,
+                             repackMap = Map.insert ix repackOffset repackMap})
+    finalize RepackState{..} = do
+        let offsets = SparseVector $ VS.fromList $ fmap (uncurry Assoc) $ Map.toList repackMap
+        writeOffsetsTo hdl offsets
+        return offsets
+    initial = RepackState {repackOffset = Offset 0, repackMap = Map.empty}
+
 
 data ConsumerConfig = ConsumerConfig {
         commandLog :: Handle,
@@ -406,17 +442,21 @@ saveFile ConsumerConfig{..} = \case
             register entries
             atomically $ putTMVar refVar (Ref segment ix) 
 
+writeOffsetsTo :: Handle -> StoredOffsets -> IO ()
+writeOffsetsTo hdl offsets = do
+    let storedOffsets = encode offsets  
+        offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
+    ByteString.hPut hdl $ encode (maxBound :: Word64)
+    ByteString.hPut hdl $ encode offsetsLen
+    ByteString.hPut hdl storedOffsets -- length on either side so we can read from the end of file or in order
+    ByteString.hPut hdl $ encode offsetsLen
+    hFlush hdl
+
 finalizeFile :: ConsumerConfig -> ConsumerState Flushed -> IO ()
 finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     hFlush commandLog
     mapM_ mark flushQueue
     let offsets = OffsetVector (VS.fromList (keys entries))
-        storedOffsets = encode offsets
-        offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
-    ByteString.hPut commandLog $ encode (maxBound :: Word64)
-    ByteString.hPut commandLog $ encode offsetsLen
-    ByteString.hPut commandLog storedOffsets -- length on either side so we can read from the end of file or in order
-    ByteString.hPut commandLog $ encode offsetsLen
-    hFlush commandLog
+    writeOffsetsTo commandLog offsets
 
 
