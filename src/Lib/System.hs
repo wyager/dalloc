@@ -4,14 +4,13 @@ import           Data.Store (Store, encode, decodeEx)
 import           Control.Concurrent.Async (Async, async)
 import           Control.Concurrent (forkIO)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
-import           Control.Concurrent.STM.TVar (TVar, newTVarIO, readTVar, writeTVar)
+import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, force)
 import           Control.Exception (evaluate)
-import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, readTBMChan)
+import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan)
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
-import           Data.ByteString (ByteString)
-import           Control.Concurrent.STM (STM, atomically)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, insertLookupWithKey, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, toList)
+import           Control.Concurrent.STM (atomically)
+import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
@@ -21,17 +20,14 @@ import           System.Directory (doesFileExist)
 import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
-import qualified Data.Vector.Unboxed as VU
-import qualified Data.Vector.Generic as VG
 import qualified Data.Vector as V
-import           Data.LruCache as Lru (LruCache, empty, insert, lookup, insertView)
+import           Data.LruCache as Lru (LruCache, empty, lookup, insertView)
 import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
 import           Streaming.Prelude (Stream, yield, breakWhen, foldM)
 import           Data.Functor.Of (Of((:>)))
-import           Data.Monoid (Sum(..))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (hoist)
 import           Numeric.Search.Range (searchFromTo)
@@ -106,8 +102,8 @@ data REnqueued = Read !Ref !(TMVar ByteString)
 
 data ReadQueue = ReadQueue (TBChan REnqueued)
 
-write :: Store a => WriteQueue -> a -> IO (Async (Ref, Flushed))
-write (WriteQueue q) value = async $ do
+storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, Flushed))
+storeToQueue (WriteQueue q) value = async $ do
     bs <- evaluate $ force $ encode $ sized value
     saved <- newEmptyTMVarIO
     flushed <- Flushed <$> newEmptyTMVarIO
@@ -138,16 +134,16 @@ data SegmentCache = SegmentCache {
 }
 
 emptySegmentCache :: Int -> SegmentCache 
-emptySegmentCache max = SegmentCache {openSegments = Lru.empty max, openSegmentDetails = Map.empty}
+emptySegmentCache maxSize = SegmentCache {openSegments = Lru.empty maxSize, openSegmentDetails = Map.empty}
 
 
 loadOffsets :: ByteString -> StoredOffsets
 loadOffsets bs | ByteString.length bs < 8 = error "Segment is too short to contain offset cache length tag"
                | otherwise = 
-                    let last n = ByteString.drop (ByteString.length bs - n) bs in 
-                    let offsetLen = fromIntegral (decodeEx (last 8) :: Word64) in
+                    let final n = ByteString.drop (ByteString.length bs - n) bs in 
+                    let offsetLen = fromIntegral (decodeEx (final 8) :: Word64) in
                     if | ByteString.length bs < 8 + offsetLen -> error "Segment is too short to contain purported offset cache"
-                       | otherwise -> let offsetsBs = ByteString.take offsetLen (last (offsetLen + 8)) in 
+                       | otherwise -> let offsetsBs = ByteString.take offsetLen (final (offsetLen + 8)) in 
                                       decodeEx offsetsBs :: StoredOffsets
 
 updateSegment :: Segment -> MMapped -> SegmentCache -> SegmentCache
@@ -155,12 +151,12 @@ updateSegment segment mmapped cache@SegmentCache{..} =
     cache {openSegmentDetails = Map.adjust (const mmapped) segment openSegmentDetails}
 
 insertSegment :: Segment -> MMapped -> SegmentCache -> SegmentCache
-insertSegment segment mmapped cache@SegmentCache{..} =  SegmentCache open' details'
+insertSegment segment mmapped SegmentCache{..} =  SegmentCache open' details'
     where
     (removed,open') = Lru.insertView segment () openSegments 
     details' = case removed of
         Nothing -> Map.insert segment mmapped openSegmentDetails 
-        Just (removed,()) -> Map.insert segment mmapped $ Map.delete removed openSegmentDetails 
+        Just (key,()) -> Map.insert segment mmapped $ Map.delete key openSegmentDetails 
 
 
 data Order = Asc | Desc
@@ -209,14 +205,14 @@ data Found a = NoK1 | NoK2 | Found a
 
 -- There's bound to be a good single-pass way of doing this, but it will take a bit to figure out
 appsert :: (Ord k1, Ord k2) => (Maybe a -> a) -> k1 -> k2  -> Map k1 (Map k2 a) -> (Map k1 (Map k2 a), Found a)
-appsert f k1 k2 map = (map', found)
+appsert f k1 k2 m = (m', found)
     where
     find = maybe NoK1 (maybe NoK2 Found . Map.lookup k2) . Map.lookup k1
-    found = find map
+    found = find m
     a' = case found of 
         Found a -> f (Just a)
         _ -> f Nothing
-    map' = Map.alter g k1 map
+    m' = Map.alter g k1 m
     g Nothing = Just (Map.singleton k2 a')
     g (Just inner) = Just (Map.insert k2 a' inner)
 
@@ -233,7 +229,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
         case toDispatch of
             Nothing -> return ()
             Just seg -> do
-                forkIO $ do
+                _tid <- forkIO $ do
                     bs <- openSeg seg
                     offsets <- evaluate $ force $ loadOffsets bs
                     atomically $ writeTBChan q (ReadComplete seg $ MMapped offsets bs)
@@ -266,7 +262,7 @@ readerStep state@ReaderState{..} = \case
                     clear ix dones = 
                         let value = readSeg mmapped ix in 
                         mapM_ (\done -> atomically (putTMVar done value)) dones
-                Map.traverseWithKey clear waiting
+                _ <- Map.traverseWithKey clear waiting
                 return (state {pending = pending', segmentCache = cache'}, Nothing)
     SegmentWasGCed seg mmapped -> 
         let cache' = updateSegment seg mmapped segmentCache in 
@@ -283,9 +279,9 @@ data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment
 initialize :: FilenameConfig -> IO InitResult
 initialize FilenameConfig{..} = do
     let searchRanges = ([0], take 64 $ iterate (*2) 1)
-        pred ix = not <$> doesFileExist (segmentPath (Segment ix))
-    searchM searchRanges divForever pred >>= \case
-        [trivial] -> doesFileExist (partialSegmentPath (Segment 0)) >>= \case
+        noSegFile ix = not <$> doesFileExist (segmentPath (Segment ix))
+    searchM searchRanges divForever noSegFile >>= \case
+        [_trivial] -> doesFileExist (partialSegmentPath (Segment 0)) >>= \case
             True -> return $ AbruptShutdown (Segment 0)
             False -> return $ NoData
         [exists,_] -> do
@@ -293,8 +289,7 @@ initialize FilenameConfig{..} = do
             doesFileExist (partialSegmentPath (Segment (highestExists + 1))) >>= \case
                 True -> return $ AbruptShutdown (Segment (highestExists + 1))
                 False -> return $ CleanShutdown (Segment highestExists)
-
-
+        _ -> error "I don't understand how searchM works"
 
 
 data CoreState = CoreState {
@@ -333,6 +328,7 @@ splitWith :: Monad m
 splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits) 
     where
     throughput (count,len) (Write _ _ bs) = (count + 1, len `plus` ByteString.length bs)
+    throughput tp          Tick           = tp
 
 
 consume :: Monad m
@@ -362,19 +358,19 @@ data SegGcState = SegGcState {
 
 gc :: GcConfig ByteString -> Set Ix -> Handle -> MMapped -> IO (StoredOffsets, Set Ref)
 gc cfg live newFile = fmap unwrap . repackFile newFile . gc' cfg live . streamSegFromOffsets Desc
-    where unwrap (offs :> live :> ()) = (offs, live)
+    where unwrap (offs :> live' :> ()) = (offs, live')
 
 
 
 gc' :: Monad m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
-gc' GcConfig{..} here = foldM step (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
+gc' GcConfig{..} here = foldM include (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
     where
-    step state (ix,bs) = if ix `Set.member` (liveHere state)
+    include state (ix,bs) = if ix `Set.member` (liveHere state)
                             then do
                                 yield (ix,bs)
-                                return (step' state ix bs)
+                                return (includeChildren state ix bs)
                             else return state
-    step' state thisIx bs = VS.foldl' step state children
+    includeChildren state thisIx bs = VS.foldl' step state children
         where
         children = childrenOf bs
         step s@SegGcState{..} ref@(Ref seg ix)
@@ -416,26 +412,27 @@ data ConsumerState flushed = ConsumerState {
     }
 
 
-data Step = Incomplete | Finalizer ByteString | Packet ByteString ByteString
-step :: ByteString -> Step
-step bs = if | totalLen < 8 -> Incomplete
-             | packetLen == maxBound -> Finalizer afterLen
-             | ByteString.length bs < 8 + packetLen' -> Incomplete
-             | otherwise -> Packet packet remainder
-        where
-        totalLen = ByteString.length bs
-        packetLen :: Word64 = decodeEx $ ByteString.take 8 bs
-        packetLen' :: Int = fromIntegral packetLen
-        afterLen = ByteString.drop 8 bs
-        (packet,remainder) = ByteString.splitAt packetLen' afterLen
+data SegmentStep = Incomplete | Finalizer ByteString | Packet ByteString ByteString
+segmentStep :: ByteString -> SegmentStep
+segmentStep bs = 
+    if | totalLen < 8 -> Incomplete
+       | packetLen == maxBound -> Finalizer afterLen
+       | ByteString.length bs < 8 + packetLen' -> Incomplete
+       | otherwise -> Packet packet remainder
+    where
+    totalLen = ByteString.length bs
+    packetLen :: Word64 = decodeEx $ ByteString.take 8 bs
+    packetLen' :: Int = fromIntegral packetLen
+    afterLen = ByteString.drop 8 bs
+    (packet,remainder) = ByteString.splitAt packetLen' afterLen
 
 stream :: Monad m => ByteString -> Stream (Of ByteString) m (Maybe ByteString)
 stream = go
     where
-    go bs = case step bs of
+    go bs = case segmentStep bs of
         Incomplete -> return Nothing
-        Finalizer next -> case step next of
-            Packet bs _ -> return (Just bs)
+        Finalizer next -> case segmentStep next of
+            Packet packet _ -> return (Just packet)
             Incomplete -> return Nothing
             Finalizer _ -> error "Repeated finalizer"
         Packet packet next -> do
@@ -477,6 +474,7 @@ saveFile ConsumerConfig{..} = \case
             -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
             register entries
             atomically $ putTMVar refVar (Ref segment ix) 
+        Nop -> return ()
 
 writeOffsetsTo :: Handle -> StoredOffsets -> IO ()
 writeOffsetsTo hdl offsets = do
