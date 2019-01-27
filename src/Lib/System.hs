@@ -250,25 +250,25 @@ appsert f k1 k2 m = (m', found)
     g Nothing = Just (Map.singleton k2 a')
     g (Just inner) = Just (Map.insert k2 a' inner)
 
-
-
 data IrrecoverableFailure 
     = IFIndexError IndexError
     | IFCacheConsistencyError CacheConsistencyError
     | IFOffsetDecodeEx OffsetDecodeEx
     | IFReaderConsistencyError ReaderConsistencyError
     | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
+    | IFInitFailure InitFailure
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
-newtype MonadDB a = MonadDB (IO a) 
+newtype DBM a = DBM (IO a) 
     deriving newtype (Functor,Applicative,Monad,MonadIO)
 
-instance MultiError IndexError             MonadDB where throw = liftIO . throwIO . IFIndexError
-instance MultiError CacheConsistencyError  MonadDB where throw = liftIO . throwIO . IFCacheConsistencyError
-instance MultiError OffsetDecodeEx         MonadDB where throw = liftIO . throwIO . IFOffsetDecodeEx
-instance MultiError ReaderConsistencyError MonadDB where throw = liftIO . throwIO . IFReaderConsistencyError
-instance MultiError StoredOffsetsDecodeEx  MonadDB where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
+instance MultiError IndexError             DBM where throw = liftIO . throwIO . IFIndexError
+instance MultiError CacheConsistencyError  DBM where throw = liftIO . throwIO . IFCacheConsistencyError
+instance MultiError OffsetDecodeEx         DBM where throw = liftIO . throwIO . IFOffsetDecodeEx
+instance MultiError ReaderConsistencyError DBM where throw = liftIO . throwIO . IFReaderConsistencyError
+instance MultiError StoredOffsetsDecodeEx  DBM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
+instance MultiError InitFailure            DBM where throw = liftIO . throwIO . IFInitFailure
 
 
 reader :: (MonadIO m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig -> ReadQueue -> m void
@@ -337,22 +337,34 @@ data FilenameConfig = FilenameConfig {
     }
 
 
-data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment | IDon'tUnderstandSearchM
+data DBConfig = DBConfig {
+        filenameConfig :: FilenameConfig
+    }
 
-initialize :: FilenameConfig -> IO InitResult
+run :: DBConfig -> DBM void
+run DBConfig{..} = do
+    _status <- initialize filenameConfig
+    undefined
+
+data InitFailure = IDon'tUnderstandSearchM deriving Show
+
+data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment 
+
+initialize :: (MonadIO m, Throws '[InitFailure] m) => FilenameConfig -> m InitResult
 initialize FilenameConfig{..} = do
     let searchRanges = ([0], take 64 $ iterate (*2) 1)
-        noSegFile ix = not <$> doesFileExist (segmentPath (Segment ix))
+        isThere = liftIO . doesFileExist
+        noSegFile ix = not <$> isThere (segmentPath (Segment ix))
     searchM searchRanges divForever noSegFile >>= \case
-        [_trivial] -> doesFileExist (partialSegmentPath (Segment 0)) >>= \case
+        [_trivial] -> isThere (partialSegmentPath (Segment 0)) >>= \case
             True -> return $ AbruptShutdown (Segment 0)
             False -> return $ NoData
         [exists,_] -> do
             let highestExists = hiVal exists
-            doesFileExist (partialSegmentPath (Segment (highestExists + 1))) >>= \case
+            isThere (partialSegmentPath (Segment (highestExists + 1))) >>= \case
                 True -> return $ AbruptShutdown (Segment (highestExists + 1))
                 False -> return $ CleanShutdown (Segment highestExists)
-        _ -> return IDon'tUnderstandSearchM
+        _ -> throw IDon'tUnderstandSearchM
 
 
 data CoreState = CoreState {
@@ -407,38 +419,61 @@ consume handle finalize = foldM step initial finalize
         return state'
 
 
+data Persistence = NormalGC
+                 | PersistentRoot deriving (Show)
+
+data NoParse = NoParse String deriving Show
 
 data GcConfig entry = GcConfig {
     thisSegment :: Segment,
-    childrenOf :: entry -> VS.Vector Ref
+    inspect :: entry -> Either NoParse (VS.Vector Ref, Persistence)
 }
+
+
+data PersistenceStatus = RootKnown
+                       | RootUnknown deriving (Show)
 
 data SegGcState = SegGcState {
     liveHere :: Set Ix,
-    liveThere :: Set Ref
+    liveThere :: Set Ref,
+    persistenceStatus :: PersistenceStatus
 }
 
 
 
-gc :: (Throws '[GCError, OffsetDecodeEx] m, MonadIO m) => GcConfig ByteString -> Set Ix -> Handle -> MMapped -> m (StoredOffsets, Set Ref)
-gc cfg live newFile = fmap unwrap . repackFile newFile . gc' cfg live . streamSegFromOffsets Desc
-    where unwrap (offs :> live' :> ()) = (offs, live')
+gc :: (Throws '[GCError, OffsetDecodeEx] m, MonadIO m) => GcConfig ByteString -> Set Ix -> PersistenceStatus -> Handle -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
+gc cfg live perst newFile = fmap unwrap . repackFile newFile . gc' cfg live perst . streamSegFromOffsets Desc
+    where unwrap (offs :> (live',perst') :> ()) = (offs, live', perst')
 
 
-data GCError = GCDeserializeError | SegmentCausalityViolation Segment Ref | IndexCausalityViolation Ix Ref deriving Show
+data GCError
+    = GCDeserializeError 
+    | SegmentCausalityViolation Segment Ref 
+    | IndexCausalityViolation Ix Ref 
+    | GCParseError NoParse
+    deriving Show
 
 
-gc' :: Throws '[GCError] m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
-gc' GcConfig{..} here = foldM include (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
+gc' :: Throws '[GCError] m => GcConfig entry -> Set Ix -> PersistenceStatus -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref, PersistenceStatus) o)
+gc' GcConfig{..} here perst = foldM include (return (SegGcState here Set.empty perst)) (return . finish) . hoist lift
     where
-    include state (ix,bs) = if ix `Set.member` (liveHere state)
-                            then do
-                                yield (ix,bs)
-                                includeChildren state ix bs
-                            else return state
-    includeChildren state thisIx bs = VS.foldM' step state children
+    finish SegGcState{..} = (liveThere, persistenceStatus)
+    include state (ix,bs) = do
+        (children, persistence) <- either (lift . throw . GCParseError) return $ inspect bs
+        let normal = if ix `Set.member` (liveHere state) 
+                then do
+                    yield (ix,bs)
+                    includeChildren state ix children
+                else return state
+        case persistence of
+            NormalGC -> normal
+            PersistentRoot -> case persistenceStatus state of
+                 RootKnown -> normal
+                 RootUnknown -> do
+                    yield (ix,bs)
+                    includeChildren (state {persistenceStatus = RootKnown}) ix children
+    includeChildren state thisIx children = VS.foldM' step state children
         where
-        children = childrenOf bs
         step s@SegGcState{..} ref@(Ref seg ix)
             | seg > thisSegment = lift $ throw $ SegmentCausalityViolation thisSegment ref 
             | seg == thisSegment && ix >= thisIx = lift $ throw $ IndexCausalityViolation thisIx ref 
