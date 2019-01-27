@@ -77,6 +77,8 @@ library:
   - mmap
   - mmorph
   - directory
+  - lifted-async
+
   ghc-options:
   - -O2
   - -Wall
