@@ -7,16 +7,16 @@ import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar
 import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO)
-import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan)
+import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, newTBMChanIO, readTBMChan)
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
 import           Control.Concurrent.STM (atomically)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
-import           System.IO (Handle, hFlush)
+import           System.IO (Handle, hFlush, IOMode(AppendMode), openFile)
 import           System.IO.MMap (mmapFileByteString)
-import           System.Directory (doesFileExist)
+import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
 import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
@@ -27,6 +27,7 @@ import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
 import           Streaming.Prelude (Stream, yield, breakWhen, foldM)
+import qualified Streaming.Prelude as SP (mapM)
 import           Data.Functor.Of (Of((:>)))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (hoist)
@@ -38,7 +39,7 @@ import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 
 newtype Segment = Segment Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
 
 newtype Ix = Ix Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
@@ -102,6 +103,16 @@ data WEnqueued flushed ref
 data MMapped = MMapped !StoredOffsets !ByteString
 
 data WriteQueue = WriteQueue (TBMChan (WEnqueued Flushed (TMVar Ref)))
+
+streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued Flushed (TMVar Ref))) m ()
+streamWriteQ (WriteQueue q) = go
+    where
+    go = (liftIO $ atomically $ readTBMChan q) >>= \case
+        Nothing -> return ()
+        Just thing -> yield thing >> go
+
+newWriteQueueIO :: Int -> IO WriteQueue
+newWriteQueueIO maxLen = WriteQueue <$> newTBMChanIO maxLen
 
 data REnqueued = Read !Ref !(TMVar ByteString)
                | ReadComplete !Segment !MMapped
@@ -257,6 +268,7 @@ data IrrecoverableFailure
     | IFReaderConsistencyError ReaderConsistencyError
     | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
     | IFInitFailure InitFailure
+    | IFSegmentStreamError SegmentStreamError
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
@@ -269,6 +281,8 @@ instance MultiError OffsetDecodeEx         DBM where throw = liftIO . throwIO . 
 instance MultiError ReaderConsistencyError DBM where throw = liftIO . throwIO . IFReaderConsistencyError
 instance MultiError StoredOffsetsDecodeEx  DBM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
 instance MultiError InitFailure            DBM where throw = liftIO . throwIO . IFInitFailure
+instance MultiError SegmentStreamError     DBM where throw = liftIO . throwIO . IFSegmentStreamError
+
 
 
 reader :: (MonadIO m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig -> ReadQueue -> m void
@@ -338,13 +352,51 @@ data FilenameConfig = FilenameConfig {
 
 
 data DBConfig = DBConfig {
-        filenameConfig :: FilenameConfig
+        filenameConfig :: FilenameConfig,
+        maxWriteQueueLen :: Int,
+        consumerLimits :: ConsumerLimits
     }
 
 run :: DBConfig -> DBM void
 run DBConfig{..} = do
-    _status <- initialize filenameConfig
-    undefined
+    status <- initialize filenameConfig
+    writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
+    initSeg <- case status of
+        NoData -> return (Segment 0)
+        CleanShutdown highestSeg -> return (succ highestSeg)
+        AbruptShutdown partialSeg -> do
+            let partialPath = partialSegmentPath filenameConfig partialSeg
+                temporaryPath = partialPath ++ ".rebuild"
+                finalPath = segmentPath filenameConfig partialSeg
+            partial <- liftIO $ mmapFileByteString partialPath Nothing
+            hdl <- liftIO $ openFile temporaryPath AppendMode 
+            let entries = streamBS partial
+                fakeWrite bs = do
+                    ref <- liftIO newEmptyTMVarIO
+                    flushed <- Flushed <$> liftIO newEmptyTMVarIO
+                    return $ Write ref flushed bs
+                fakeWriteQ = SP.mapM fakeWrite entries
+                config = ConsumerConfig hdl partialSeg (const (return ()))
+            () :> _savedOffs <- consumeFile config fakeWriteQ
+            liftIO $ do
+                renameFile temporaryPath finalPath
+                removeFile partialPath
+            return (succ partialSeg)
+    let consumeChunk seg writes = do
+            let filepath = partialSegmentPath filenameConfig seg
+            hdl <- liftIO $ openFile filepath AppendMode
+            let hotcache = error "fix me"
+            () :> r <- consumeFile (ConsumerConfig hdl seg hotcache) writes
+            return r
+    let loop seg stream = do
+        stream' <- consumeChunk seg $ splitWith consumerLimits stream
+        loop (succ seg) stream'
+    loop initSeg (streamWriteQ writeQ)
+
+
+
+
+
 
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
@@ -406,17 +458,6 @@ splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits)
     throughput tp          Tick           = tp
 
 
-consume :: Monad m
-        => (ConsumerAction flushed ref -> m ()) 
-        -> (ConsumerState flushed -> m o)
-        -> Stream (Of (WEnqueued flushed ref)) m r -> m (Of o r)
-consume handle finalize = foldM step initial finalize
-    where
-    initial = return (ConsumerState Map.empty (Offset 0) [])
-    step state write = do
-        let (state', action) = consume' state write
-        handle action
-        return state'
 
 
 data Persistence = NormalGC
@@ -539,8 +580,8 @@ class Monad m => MultiError e m where
     throw :: e -> m a
 
 
-stream :: Throws '[SegmentStreamError] m => ByteString -> Stream (Of ByteString) m (Maybe ByteString)
-stream = go
+streamBS :: Throws '[SegmentStreamError] m => ByteString -> Stream (Of ByteString) m (Maybe ByteString)
+streamBS = go
     where
     go bs = case segmentStep bs of
         Incomplete -> return Nothing
@@ -552,10 +593,20 @@ stream = go
             yield packet
             go next
 
-
-
 data ConsumerAction flushed ref = Flush [flushed] | WriteToLog ByteString (Map Offset ByteString) ref Ix | Nop
 
+
+consume :: Monad m
+        => (ConsumerAction flushed ref -> m ()) 
+        -> (ConsumerState flushed -> m o)
+        -> Stream (Of (WEnqueued flushed ref)) m r -> m (Of o r)
+consume handle finalize = foldM step initial finalize
+    where
+    initial = return (ConsumerState Map.empty (Offset 0) [])
+    step state write = do
+        let (state', action) = consume' state write
+        handle action
+        return state'
 
 
 consume' :: ConsumerState flushed -> WEnqueued flushed ref -> (ConsumerState flushed, ConsumerAction flushed ref)
@@ -571,8 +622,8 @@ consume' state@ConsumerState{..} = \case
             WriteToLog bs entries' refVar ix)
 
 
-consumeFile :: ConsumerConfig -> Stream (Of (WEnqueued Flushed (TMVar Ref))) IO r -> IO (Of () r)
-consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
+consumeFile :: MonadIO m => ConsumerConfig -> Stream (Of (WEnqueued Flushed (TMVar Ref))) m r -> m (Of () r)
+consumeFile cfg = consume (liftIO . saveFile cfg) (liftIO . finalizeFile cfg)
 
 saveFile :: ConsumerConfig -> ConsumerAction Flushed (TMVar Ref) -> IO ()
 saveFile ConsumerConfig{..} = \case
