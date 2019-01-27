@@ -6,7 +6,7 @@ import           Control.Concurrent.Async (Async, async, link)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
 import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
-import           Control.Exception (evaluate)
+import           Control.Exception (Exception,evaluate, throwIO)
 import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan)
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
 import           Control.Concurrent.STM (atomically)
@@ -35,6 +35,7 @@ import           Numeric.Search (searchM, divForever, hiVal)
 -- import           Control.Monad.Error.Class (MonadError, throwError)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           GHC.Exts (Constraint)
+import           Type.Reflection (Typeable)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
@@ -63,7 +64,7 @@ data StoredOffsets = OffsetVector (VS.Vector Offset)
     deriving anyclass (Store, NFData)
 
 
-data IndexError = IndexNotFound Ix
+data IndexError = IndexNotFound Ix deriving Show
 
 offset :: Throws '[IndexError] m =>  StoredOffsets -> Ix -> m Offset
 offset (OffsetVector v) (Ix i) = return $ v VS.! (fromIntegral i)
@@ -154,7 +155,7 @@ type family Throws (ts::[k]) (m :: * -> *) :: Constraint where
     Throws (t ': ts) m = (MultiError t m, Throws ts m)
 
 
-data StoredOffsetsDecodeEx = CacheLengthDecodeEx PeekException | CacheDecodeEx PeekException | SegmentTooShortForCache
+data StoredOffsetsDecodeEx = CacheLengthDecodeEx PeekException | CacheDecodeEx PeekException | SegmentTooShortForCache deriving Show
 
 instance NFData StoredOffsetsDecodeEx where
     rnf (CacheLengthDecodeEx _) = ()
@@ -202,7 +203,7 @@ streamSegFromOffsets order (MMapped stored bs) = mapM_ load offsets
         SparseVector v -> fmap (\(Assoc ix off) -> (ix,off)) $ VS.toList v
 
 
-data OffsetDecodeEx = OffsetDecodeEx PeekException
+data OffsetDecodeEx = OffsetDecodeEx PeekException deriving Show
 
 readOff :: Throws '[OffsetDecodeEx] m => ByteString -> Offset -> m ByteString
 readOff bs (Offset theOffset) = do
@@ -214,7 +215,7 @@ readSeg (MMapped offs bs) ix = readOff bs =<< offset offs ix
 
     
 
-data CacheConsistencyError = SegmentInDetailsButNotLRU Segment
+data CacheConsistencyError = SegmentInDetailsButNotLRU Segment deriving Show
 
 readSegCache :: (Throws [IndexError, CacheConsistencyError, OffsetDecodeEx] m) => SegmentCache -> Ref -> m (Maybe (ByteString, SegmentCache))
 readSegCache cache@SegmentCache{..} (Ref seg ix) = 
@@ -250,6 +251,26 @@ appsert f k1 k2 m = (m', found)
     g (Just inner) = Just (Map.insert k2 a' inner)
 
 
+
+data IrrecoverableFailure 
+    = IFIndexError IndexError
+    | IFCacheConsistencyError CacheConsistencyError
+    | IFOffsetDecodeEx OffsetDecodeEx
+    | IFReaderConsistencyError ReaderConsistencyError
+    | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
+    deriving stock (Typeable, Show)
+    deriving anyclass Exception
+
+newtype MonadDB a = MonadDB (IO a) 
+    deriving newtype (Functor,Applicative,Monad,MonadIO)
+
+instance MultiError IndexError             MonadDB where throw = liftIO . throwIO . IFIndexError
+instance MultiError CacheConsistencyError  MonadDB where throw = liftIO . throwIO . IFCacheConsistencyError
+instance MultiError OffsetDecodeEx         MonadDB where throw = liftIO . throwIO . IFOffsetDecodeEx
+instance MultiError ReaderConsistencyError MonadDB where throw = liftIO . throwIO . IFReaderConsistencyError
+instance MultiError StoredOffsetsDecodeEx  MonadDB where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
+
+
 reader :: (MonadIO m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig -> ReadQueue -> m void
 reader ReaderConfig{..} (ReadQueue q) = go initial
     where
@@ -272,7 +293,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
         
 
 
-data ReaderConsistencyError = ReadCompletedButNoOneCared Segment
+data ReaderConsistencyError = ReadCompletedButNoOneCared Segment deriving Show
 
 readerStep :: (MonadIO m, Throws '[IndexError, OffsetDecodeEx, StoredOffsetsDecodeEx, CacheConsistencyError, ReaderConsistencyError] m) => ReaderState -> REnqueued -> m (ReaderState, Maybe Segment)
 readerStep state@ReaderState{..} = \case
@@ -404,7 +425,7 @@ gc cfg live newFile = fmap unwrap . repackFile newFile . gc' cfg live . streamSe
     where unwrap (offs :> live' :> ()) = (offs, live')
 
 
-data GCError = GCDeserializeError | SegmentCausalityViolation Segment Ref | IndexCausalityViolation Ix Ref
+data GCError = GCDeserializeError | SegmentCausalityViolation Segment Ref | IndexCausalityViolation Ix Ref deriving Show
 
 
 gc' :: Throws '[GCError] m => GcConfig entry -> Set Ix -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref) o)
@@ -476,7 +497,7 @@ segmentStep bs =
     (packet,remainder) = ByteString.splitAt packetLen' afterLen
 
 
-data SegmentStreamError = RepeatedFinalizer
+data SegmentStreamError = RepeatedFinalizer deriving Show
 
 -- no fundep m -> e
 class Monad m => MultiError e m where
