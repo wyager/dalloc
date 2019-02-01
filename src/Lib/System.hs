@@ -1,19 +1,21 @@
 module Lib.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
-import           Control.Concurrent.Async (Async, async, link)
+import           Control.Concurrent.Async (Async, async, link, waitAny)
 -- import           Control.Concurrent (forkIO)
 import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
 import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO)
 import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, newTBMChanIO, readTBMChan)
-import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan)
+import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan, newTBChanIO)
 import           Control.Concurrent.STM (atomically)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, toList)
+import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
+import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
+import           Data.Foldable (toList)
 import           System.IO (Handle, hFlush, IOMode(AppendMode), openFile)
 import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
@@ -37,6 +39,7 @@ import           Numeric.Search (searchM, divForever, hiVal)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
+import           Data.Void (Void)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
@@ -120,6 +123,9 @@ data REnqueued = Read !Ref !(TMVar ByteString)
                | SegmentWasGCed !Segment !MMapped -- The new segment (mmapped)
 
 data ReadQueue = ReadQueue (TBChan REnqueued)
+
+readQueue :: Int -> IO ReadQueue
+readQueue maxLen = ReadQueue <$> newTBChanIO maxLen
 
 storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, Flushed))
 storeToQueue (WriteQueue q) value = async $ do
@@ -272,7 +278,7 @@ data IrrecoverableFailure
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
-newtype DBM a = DBM (IO a) 
+newtype DBM a = DBM {runDBM :: IO a}
     deriving newtype (Functor,Applicative,Monad,MonadIO)
 
 instance MultiError IndexError             DBM where throw = liftIO . throwIO . IFIndexError
@@ -354,14 +360,23 @@ data FilenameConfig = FilenameConfig {
 data DBConfig = DBConfig {
         filenameConfig :: FilenameConfig,
         maxWriteQueueLen :: Int,
+        maxReadQueueLen :: Int,
+        readQueueShardShift :: Int,
+        readerConfig :: ReaderConfig,
         consumerLimits :: ConsumerLimits
     }
 
-run :: DBConfig -> DBM void
-run DBConfig{..} = do
-    status <- initialize filenameConfig
-    writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
-    initSeg <- case status of
+data DBState = DBState {
+    dbReaders :: Readers,
+    dbReaderExn :: Async Void,
+    dbWriter :: WriteQueue,
+    dbWriterExn :: Async Void
+}
+
+
+
+loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
+loadInitSeg filenameConfig status = case status of
         NoData -> return (Segment 0)
         CleanShutdown highestSeg -> return (succ highestSeg)
         AbruptShutdown partialSeg -> do
@@ -382,21 +397,14 @@ run DBConfig{..} = do
                 renameFile temporaryPath finalPath
                 removeFile partialPath
             return (succ partialSeg)
-    let consumeChunk seg writes = do
-            let filepath = partialSegmentPath filenameConfig seg
-            hdl <- liftIO $ openFile filepath AppendMode
-            let hotcache = error "fix me"
-            () :> r <- consumeFile (ConsumerConfig hdl seg hotcache) writes
-            return r
-    let loop seg stream = do
-        stream' <- consumeChunk seg $ splitWith consumerLimits stream
-        loop (succ seg) stream'
-    loop initSeg (streamWriteQ writeQ)
 
-
-
-
-
+setup :: DBConfig -> DBM DBState
+setup DBConfig{..} = do
+    status <- initialize filenameConfig
+    initSeg <- loadInitSeg filenameConfig status
+    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
+    (writer, writerExn) <- liftIO $ spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits
+    return $ DBState readers readersExn writer writerExn
 
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
@@ -432,6 +440,37 @@ data GcState = GcState {
 -- Sharded by segment hash
 data Readers = Readers {shardShift :: Int, 
                         shards :: V.Vector ReadQueue}
+
+
+spawnWriter :: Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async exception)
+spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits = do
+    writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
+    let consumeChunk seg writes = do
+            let filepath = partialSegmentPath filenameConfig seg
+            hdl <- liftIO $ openFile filepath AppendMode
+            let hotcache = error "fix me"
+            () :> r <- consumeFile (ConsumerConfig hdl seg hotcache) writes
+            return r
+        loop seg stream = do
+            stream' <- consumeChunk seg $ splitWith consumerLimits stream
+            loop (succ seg) stream'
+    exn <- async $ loop initSeg (streamWriteQ writeQ)
+    return (writeQ, exn)
+
+spawnReaders :: Int -> Int -> ReaderConfig -> IO (Readers, Async exception)
+spawnReaders qLen shardShift cfg = do
+    let spawn = do
+        readQ <- readQueue qLen
+        thread <- async $ runDBM $ reader cfg readQ
+        return (readQ, thread)
+    spawned <- V.replicateM (2 ^ shardShift) spawn 
+    let (queues, threads) = V.unzip spawned
+    exception <- async $ do
+        (_, impossible) <- waitAny (toList threads)
+        return impossible
+    return (Readers shardShift queues, exception)
+
+
 
 data ReadCache = ReadCache {
         readers :: Readers,
