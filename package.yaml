@@ -78,7 +78,8 @@ library:
   - mmorph
   - directory
   - lifted-async
-
+  - binary-search
+  - containers
   ghc-options:
   - -O2
   - -Wall
@@ -100,9 +101,9 @@ executables:
     - vector
     - binary
     - cereal
-    - containers
     - streaming
-    - binary-search
+    - stm
+    
 
 tests:
   dalloc-test:

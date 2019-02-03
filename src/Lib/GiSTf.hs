@@ -2,17 +2,14 @@ module Lib.GiSTf where
 
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector, fromList)
-import Data.Vector.Generic as Vec (Vector, concat, filter, foldl, cons, toList, imap, ifoldl, singleton, length, fromList, head, tail, splitAt, empty, foldM, span)
-import Data.Monoid (Endo(..), Any(Any,getAny))
+import Data.Vector.Generic as Vec (Vector, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Monoid (Endo(..))
 import Data.Semigroup (Min(Min,getMin))
 import Data.Foldable (fold)
-import Data.List (sort, sortOn, splitAt)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose(Compose))
-import Data.Functor.Sum (Sum(InL,InR))
 import GHC.Exts (Constraint)
 import Data.Proxy (Proxy(Proxy))
-import Data.Functor.Classes (Show1)
 import Data.Functor.Identity (Identity(..))
 import qualified Data.Vector.Unboxed as U
 
@@ -139,7 +136,7 @@ insert' :: forall write height read vec set key value .  (Monad read, Functor wr
        => FillFactor -> key -> value 
        -> GiSTn height read vec set key value -> read (write (Either (GiSTn height write vec set key value) (GiSTn ('S height) write vec set key value)))
 insert' ff k v (GiSTn g) = insertAndSplit @write ff k v g >>= \case
-            One (set, gist) -> return $ fmap (Left  . GiSTn) $ gist
+            One (_set, gist) -> return $ fmap (Left  . GiSTn) $ gist
             Two a b         -> return $ fmap (Right . GiSTn) $ saveNode $ Node $ V.fromList [fmap Left a, fmap Left b]
         
 insertAndSplit :: forall write height read vec set key value . (Monad read, RW read write vec set key value) 

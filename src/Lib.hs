@@ -1,24 +1,6 @@
 module Lib () where
 
-import Data.Word (Word64)
-import Data.ByteString (ByteString)
-import Data.Store (Store, peek, poke)
-import Data.Fix (Fix)
-import qualified Data.Store as Store
 
-
-newtype Gen = Gen Word64 deriving newtype Store
-newtype Ix = Ix Word64 deriving newtype Store
-
-data Ptr = Ptr !Gen !Ix
-
-instance Store Ptr where
-    size = Store.ConstSize 16
-    poke (Ptr gen ix) = poke gen >> poke ix
-    peek = Ptr <$> peek <*> peek
-
-class StoreM m where
-    store :: ByteString -> m Ptr
 
 -- f :: (Monad m, StoreM m, (forall a . Store a => Store (f a))) => m (Fix f)
 -- f = undefined

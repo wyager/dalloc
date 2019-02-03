@@ -1,7 +1,17 @@
 module Main (main) where
 
+import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
+import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
+import           Control.Concurrent.STM (atomically)
+import Control.Concurrent (forkIO)
+
 main :: IO ()
-main = return ()
+main = do
+    let put1k var = mapM_ (\_ -> putMVar var ()) (replicate 1000 ())
+    let take1k var = mapM_ (\_ -> takeMVar var) (replicate 1000 ())
+    vars <- mapM (\_ -> newEmptyMVar) (replicate 100 ())
+    mapM_ (\var -> forkIO $ put1k var) vars
+    mapM_ take1k vars
 
 -- import Lib
 -- import Lib.Writer as W
