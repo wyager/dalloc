@@ -15,6 +15,7 @@ import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
+import           Data.ByteString.Builder (Builder, byteString)
 import           Data.Foldable (toList)
 import           System.IO (Handle, hFlush, IOMode(AppendMode), openFile)
 import           System.IO.MMap (mmapFileByteString)
@@ -40,6 +41,9 @@ import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void)
+import           Control.Monad.Reader (ReaderT(..), ask)
+import           Control.Monad.State (StateT(..), modify)
+import           Control.Monad.Identity (Identity(..))
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
@@ -95,9 +99,7 @@ instance Storable Ref where
     peek rp = let (sp,ip) = refPtrs rp in Ref <$> peek sp <*> peek ip
     poke rp (Ref s i) = let (sp,ip) = refPtrs rp in poke sp s >> poke ip i
 
-newtype Flushed = Flushed (TMVar ())
-mark :: Flushed -> IO ()
-mark (Flushed mvar) = atomically $ putTMVar mvar ()
+data Flushed = Flushed
 
 data WEnqueued flushed ref
     = Write !ref !flushed !ByteString
@@ -105,9 +107,9 @@ data WEnqueued flushed ref
 
 data MMapped = MMapped !StoredOffsets !ByteString
 
-data WriteQueue = WriteQueue (TBMChan (WEnqueued Flushed (TMVar Ref)))
+data WriteQueue = WriteQueue (TBMChan (WEnqueued (TMVar Flushed) (TMVar Ref)))
 
-streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued Flushed (TMVar Ref))) m ()
+streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued (TMVar Flushed) (TMVar Ref))) m ()
 streamWriteQ (WriteQueue q) = go
     where
     go = (liftIO $ atomically $ readTBMChan q) >>= \case
@@ -127,11 +129,11 @@ data ReadQueue = ReadQueue (TBChan REnqueued)
 readQueue :: Int -> IO ReadQueue
 readQueue maxLen = ReadQueue <$> newTBChanIO maxLen
 
-storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, Flushed))
+storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, TMVar Flushed))
 storeToQueue (WriteQueue q) value = async $ do
     bs <- evaluate $ force $ encode $ sized value
     saved <- newEmptyTMVarIO
-    flushed <- Flushed <$> newEmptyTMVarIO
+    flushed <- newEmptyTMVarIO
     atomically $ writeTBMChan q $ Write saved flushed bs
     ref <- atomically $ takeTMVar saved
     return (ref, flushed)
@@ -373,6 +375,9 @@ data DBState = DBState {
     dbWriterExn :: Async Void
 }
 
+dbFinish :: DBState -> IO Void
+dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
+
 
 
 loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
@@ -388,11 +393,11 @@ loadInitSeg filenameConfig status = case status of
             let entries = streamBS partial
                 fakeWrite bs = do
                     ref <- liftIO newEmptyTMVarIO
-                    flushed <- Flushed <$> liftIO newEmptyTMVarIO
+                    flushed <- liftIO newEmptyTMVarIO
                     return $ Write ref flushed bs
                 fakeWriteQ = SP.mapM fakeWrite entries
-                config = ConsumerConfig hdl partialSeg (const (return ()))
-            () :> _savedOffs <- consumeFile config fakeWriteQ
+                config = ConsumerConfig partialSeg (const (return ()))
+            () :> _savedOffs <- runReaderT (consumeFile config (hoist lift fakeWriteQ)) hdl
             liftIO $ do
                 renameFile temporaryPath finalPath
                 removeFile partialPath
@@ -449,7 +454,7 @@ spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits = do
             let filepath = partialSegmentPath filenameConfig seg
             hdl <- liftIO $ openFile filepath AppendMode
             let hotcache = error "fix me"
-            () :> r <- consumeFile (ConsumerConfig hdl seg hotcache) writes
+            () :> r <- runReaderT (consumeFile (ConsumerConfig seg hotcache) writes) hdl
             return r
         loop seg stream = do
             stream' <- consumeChunk seg $ splitWith consumerLimits stream
@@ -521,6 +526,23 @@ data SegGcState = SegGcState {
 
 
 
+
+
+class Monad m => Writable m where
+    writeM :: ByteString -> m ()
+    flushM :: m ()
+
+instance MonadIO m => Writable (ReaderT Handle m) where
+    writeM bs = ask >>= \hdl -> liftIO (ByteString.hPut hdl bs)
+    flushM = ask >>= \hdl -> liftIO (hFlush hdl)
+
+instance Monad m => Writable (StateT Builder m) where
+    writeM bs = modify (<> byteString bs)
+    flushM = return ()
+
+-- instance MonadState Builder m => Writable
+
+
 gc :: (Throws '[GCError, OffsetDecodeEx] m, MonadIO m) => GcConfig ByteString -> Set Ix -> PersistenceStatus -> Handle -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
 gc cfg live perst newFile = fmap unwrap . repackFile newFile . gc' cfg live perst . streamSegFromOffsets Desc
     where unwrap (offs :> (live',perst') :> ()) = (offs, live', perst')
@@ -575,15 +597,14 @@ repackFile hdl = foldM step (return initial) finalize
                              repackMap = Map.insert ix repackOffset repackMap})
     finalize RepackState{..} = do
         let offsets = SparseVector $ VS.fromList $ fmap (uncurry Assoc) $ Map.toList repackMap
-        liftIO $ writeOffsetsTo hdl offsets
+        runReaderT (writeOffsetsTo offsets) hdl
         return offsets
     initial = RepackState {repackOffset = Offset 0, repackMap = Map.empty}
 
 
-data ConsumerConfig = ConsumerConfig {
-        commandLog :: Handle,
+data ConsumerConfig m = ConsumerConfig {
         segment :: Segment,
-        register :: Map Offset ByteString -> IO () -- Should save in "hot" of ReadCache
+        register :: Map Offset ByteString -> m () -- Should save in "hot" of ReadCache
     }
 
 data ConsumerState flushed = ConsumerState {
@@ -661,40 +682,50 @@ consume' state@ConsumerState{..} = \case
             WriteToLog bs entries' refVar ix)
 
 
-consumeFile :: MonadIO m => ConsumerConfig -> Stream (Of (WEnqueued Flushed (TMVar Ref))) m r -> m (Of () r)
-consumeFile cfg = consume (liftIO . saveFile cfg) (liftIO . finalizeFile cfg)
+consumeFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (var Flushed) (var Ref))) m r -> m (Of () r)
+consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
-saveFile :: ConsumerConfig -> ConsumerAction Flushed (TMVar Ref) -> IO ()
-saveFile ConsumerConfig{..} = \case
+
+class MonadVar var m where
+    putVar :: var a -> a -> m ()
+
+instance MonadIO m => MonadVar TMVar m where
+    putVar var = liftIO . atomically . putTMVar var
+
+instance MonadVar whatever Identity where
+    putVar _ _ = return ()
+
+saveFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerAction (var Flushed) (var Ref) -> m ()
+saveFile ConsumerConfig{..} action = case action of
         Flush flushed -> do
-            hFlush commandLog
-            mapM_ mark flushed
+            flushM
+            mapM_ (`putVar` Flushed) flushed
         WriteToLog bs entries refVar ix -> do
-            ByteString.hPut commandLog bs
+            writeM bs
             -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
             -- We *must* make a globally visible update to the hot cache before returning the ref, or else
             -- someone could try to do a read that would fail.
             -- I *think* if we use STM vars to keep track of the hot cache and also to return the ref,
             -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
             register entries
-            atomically $ putTMVar refVar (Ref segment ix) 
+            putVar refVar (Ref segment ix) 
         Nop -> return ()
 
-writeOffsetsTo :: Handle -> StoredOffsets -> IO ()
-writeOffsetsTo hdl offsets = do
+writeOffsetsTo :: Writable m => StoredOffsets -> m ()
+writeOffsetsTo offsets = do
     let storedOffsets = encode offsets  
         offsetsLen = fromIntegral (ByteString.length storedOffsets) :: Word64 
-    ByteString.hPut hdl $ encode (maxBound :: Word64)
-    ByteString.hPut hdl $ encode offsetsLen
-    ByteString.hPut hdl storedOffsets -- length on either side so we can read from the end of file or in order
-    ByteString.hPut hdl $ encode offsetsLen
-    hFlush hdl
+    writeM $ encode (maxBound :: Word64)
+    writeM $ encode offsetsLen
+    writeM storedOffsets -- length on either side so we can read from the end of file or in order
+    writeM $ encode offsetsLen
+    flushM
 
-finalizeFile :: ConsumerConfig -> ConsumerState Flushed -> IO ()
+finalizeFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerState (var Flushed) -> m ()
 finalizeFile ConsumerConfig{..} ConsumerState{..} = do
-    hFlush commandLog
-    mapM_ mark flushQueue
+    flushM
+    mapM_ (`putVar` Flushed) flushQueue
     let offsets = OffsetVector (VS.fromList (keys entries))
-    writeOffsetsTo commandLog offsets
+    writeOffsetsTo offsets
 
 
