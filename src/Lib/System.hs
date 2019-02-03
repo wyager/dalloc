@@ -44,6 +44,7 @@ import           Data.Void (Void)
 import           Control.Monad.Reader (ReaderT(..), ask)
 import           Control.Monad.State (StateT(..), modify)
 import           Control.Monad.Identity (Identity(..))
+import           Data.Proxy (Proxy(Proxy))
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
@@ -688,12 +689,15 @@ consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
 class MonadVar var m where
     putVar :: var a -> a -> m ()
+    newEmptyVar :: m (var a)
 
 instance MonadIO m => MonadVar TMVar m where
     putVar var = liftIO . atomically . putTMVar var
+    newEmptyVar = liftIO newEmptyTMVarIO
 
-instance MonadVar whatever Identity where
+instance MonadVar Proxy Identity where
     putVar _ _ = return ()
+    newEmptyVar = return Proxy
 
 saveFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerAction (var Flushed) (var Ref) -> m ()
 saveFile ConsumerConfig{..} action = case action of
