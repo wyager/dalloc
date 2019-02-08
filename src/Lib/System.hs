@@ -1,7 +1,7 @@
 module Lib.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
-import           Control.Concurrent.Async (Async, async, link, waitAny)
+import           Control.Concurrent.Async (Async, async, link, waitAny, wait)
 -- import           Control.Concurrent (forkIO)
 import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 import           Control.Concurrent.STM.TVar (TVar)
@@ -29,8 +29,9 @@ import           Data.Hashable (Hashable)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
-import           Streaming.Prelude (Stream, yield, breakWhen, foldM)
+import           Streaming.Prelude (Stream, yield, foldM, next)
 import qualified Streaming.Prelude as SP (mapM)
+import           Streaming (wrap, mapsM_)
 import           Data.Functor.Of (Of((:>)))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (hoist)
@@ -38,12 +39,14 @@ import           Numeric.Search.Range (searchFromTo)
 import           Numeric.Search (searchM, divForever, hiVal)
 -- import           Control.Monad.Error.Class (MonadError, throwError)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
+import           Control.Monad.Except (ExceptT, throwError)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
-import           Data.Void (Void)
+import           Data.Void (Void, absurd)
 import           Control.Monad.Reader (ReaderT(..), ask)
-import           Control.Monad.State (StateT(..), modify)
+import           Control.Monad.State.Strict (StateT(..), modify, get, put, execStateT)
 import           Control.Monad.Identity (Identity(..))
+import           Control.Monad (replicateM)
 import           Data.Proxy (Proxy(Proxy))
 
 newtype Segment = Segment Word64
@@ -138,6 +141,9 @@ storeToQueue (WriteQueue q) value = async $ do
     atomically $ writeTBMChan q $ Write saved flushed bs
     ref <- takeMVar saved
     return (ref, flushed)
+
+flushWriteQueue :: WriteQueue -> IO ()
+flushWriteQueue (WriteQueue q) = atomically $ writeTBMChan q $ Tick
 
 
 mmap :: (MonadIO m, Throws '[StoredOffsetsDecodeEx] m) => FilePath -> m MMapped
@@ -292,6 +298,16 @@ instance MultiError StoredOffsetsDecodeEx  DBM where throw = liftIO . throwIO . 
 instance MultiError InitFailure            DBM where throw = liftIO . throwIO . IFInitFailure
 instance MultiError SegmentStreamError     DBM where throw = liftIO . throwIO . IFSegmentStreamError
 
+newtype MockDBMT m a = MockDBMT {runMockDBMT :: ExceptT IrrecoverableFailure m a}
+    deriving newtype (Functor, Applicative, Monad)
+
+instance Monad m => MultiError IndexError             (MockDBMT m) where throw = MockDBMT . throwError . IFIndexError
+instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = MockDBMT . throwError . IFCacheConsistencyError
+instance Monad m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = MockDBMT . throwError . IFOffsetDecodeEx
+instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw = MockDBMT . throwError . IFReaderConsistencyError
+instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = MockDBMT . throwError . IFStoredOffsetsDecodeEx
+instance Monad m => MultiError InitFailure            (MockDBMT m) where throw = MockDBMT . throwError . IFInitFailure
+instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = MockDBMT . throwError . IFSegmentStreamError
 
 
 reader :: (MonadIO m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig -> ReadQueue -> m void
@@ -369,16 +385,37 @@ data DBConfig = DBConfig {
         consumerLimits :: ConsumerLimits
     }
 
+defaultDBConfig :: FilePath -> DBConfig
+defaultDBConfig rundir = DBConfig{..}
+    where
+    segPath seg = rundir ++ "/" ++ show seg
+    filenameConfig = FilenameConfig {
+            segmentPath = segPath,
+            partialSegmentPath = (\seg -> segPath seg ++ "~")
+        }
+    maxWriteQueueLen = 16
+    maxReadQueueLen = 16
+    readQueueShardShift = 0
+    readerConfig = ReaderConfig {
+            openSeg = (\seg -> mmapFileByteString (segPath seg) Nothing),
+            lruSize = 16,
+            maxOpenSegs = 16
+        }
+    consumerLimits = ConsumerLimits {
+            cutoffCount = 1024,
+            cutoffLength = 1024*1024
+        }
+
+
 data DBState = DBState {
     dbReaders :: Readers,
     dbReaderExn :: Async Void,
     dbWriter :: WriteQueue,
-    dbWriterExn :: Async Void
+    dbWriterExn :: Async Segment
 }
 
-dbFinish :: DBState -> IO Void
-dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
-
+dbFinish :: DBState -> IO Segment
+dbFinish DBState{..} = snd <$> waitAny [fmap absurd dbReaderExn, dbWriterExn]
 
 
 loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
@@ -448,19 +485,24 @@ data Readers = Readers {shardShift :: Int,
                         shards :: V.Vector ReadQueue}
 
 
-spawnWriter :: Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async exception )
+spawnWriter :: Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Segment )
 spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
-    let consumeChunk seg writes = do
+    let chunks = hoist lift $ splitWith @IO consumerLimits (streamWriteQ writeQ)
+        writeSeg :: Segment -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) IO x -> IO x
+        writeSeg seg writes = do
             let filepath = partialSegmentPath filenameConfig seg
-            hdl <- liftIO $ openFile filepath AppendMode
-            let hotcache = error "fix me"
-            () :> r <- runReaderT (consumeFile (ConsumerConfig seg hotcache) writes) hdl
+            hdl <- openFile filepath AppendMode
+            let registerHotcache _offsets = return () -- NB TODO: Actually use the ReadCache
+                consumeToHdl = consumeFile @(ReaderT Handle IO) (ConsumerConfig seg registerHotcache) (hoist lift writes)
+            renameFile filepath (segmentPath filenameConfig seg)
+            () :> r <- runReaderT consumeToHdl hdl
             return r
-        loop seg stream = do
-            stream' <- consumeChunk seg $ splitWith consumerLimits stream
-            loop (succ seg) stream'
-    exn <- async $ loop initSeg (streamWriteQ writeQ)
+        writeSegS writes = do
+            seg <- get
+            put (succ seg)
+            liftIO $ writeSeg seg writes
+    exn <- async $ flip execStateT initSeg $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
 spawnReaders :: Int -> Int -> ReaderConfig -> IO (Readers, Async exception)
@@ -493,12 +535,26 @@ data ConsumerLimits = ConsumerLimits {
 exceeds :: (Int, Offset) -> ConsumerLimits -> Bool
 (count,len) `exceeds` ConsumerLimits{..} = count >= cutoffCount || len >= cutoffLength
 
-splitWith :: Monad m
+
+
+splitAfter :: forall x a m r . Monad m => (x -> a -> x) -> x -> (x -> Bool) -> Stream (Of a) m r -> Stream (Stream (Of a) m) m r
+splitAfter step initial predicate = go
+    where
+    go = wrap . segment initial
+    segment x stream = lift (next stream) >>= \case
+        Left r -> return (return r)
+        Right (a, stream') -> do
+            yield a
+            let x' = step x a
+            if predicate x'
+                then return (go stream')
+                else segment x' stream'
+
+splitWith :: forall m flushed ref a . Monad m
           => ConsumerLimits 
           -> Stream (Of (WEnqueued flushed ref)) m a 
-          -> Stream (Of (WEnqueued flushed ref)) m 
-           ((Stream (Of (WEnqueued flushed ref)) m a))
-splitWith limits = breakWhen throughput (0,0) id (`exceeds` limits) 
+          -> Stream (Stream (Of (WEnqueued flushed ref)) m) m a
+splitWith limits = splitAfter throughput (0,0) (`exceeds` limits) 
     where
     throughput (count,len) (Write _ _ bs) = (count + 1, len `plus` ByteString.length bs)
     throughput tp          Tick           = tp
@@ -645,13 +701,13 @@ streamBS = go
     where
     go bs = case segmentStep bs of
         Incomplete -> return Nothing
-        Finalizer next -> case segmentStep next of
+        Finalizer rest -> case segmentStep rest of
             Packet packet _ -> return (Just packet)
             Incomplete -> return Nothing
             Finalizer _ -> lift $ throw RepeatedFinalizer
-        Packet packet next -> do
+        Packet packet rest -> do
             yield packet
-            go next
+            go rest
 
 data ConsumerAction flushed ref = Flush [flushed] | WriteToLog ByteString (Map Offset ByteString) ref Ix | Nop
 
@@ -682,7 +738,7 @@ consume' state@ConsumerState{..} = \case
             WriteToLog bs entries' refVar ix)
 
 
-consumeFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (var Flushed) (var Ref))) m r -> m (Of () r)
+consumeFile :: forall m var r . (MonadVar var m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (var Flushed) (var Ref))) m r -> m (Of () r)
 consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
 
@@ -708,8 +764,7 @@ saveFile ConsumerConfig{..} action = case action of
             -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
             -- We *must* make a globally visible update to the hot cache before returning the ref, or else
             -- someone could try to do a read that would fail.
-            -- I *think* if we use STM vars to keep track of the hot cache and also to return the ref,
-            -- we should be fine - even if the updates happen in separate atomic blocks. But not 100% sure.
+            -- Can't use IORef - weak memory model. MVar should be fine. STM/MVar interaction OK?
             register entries
             putVar refVar (Ref segment ix) 
         Nop -> return ()
@@ -730,5 +785,17 @@ finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     mapM_ (`putVar` Flushed) flushQueue
     let offsets = OffsetVector (VS.fromList (keys entries))
     writeOffsetsTo offsets
+
+demo :: IO () 
+demo = do
+    let cfg = defaultDBConfig "/tmp/rundir"
+    state <- runDBM (setup cfg)
+    let wq = dbWriter state
+    writes <- replicateM (16*1024) (storeToQueue wq (ByteString.replicate 4096 0x44))
+    (refs,flushes) <- unzip <$> mapM wait writes
+    flushWriteQueue wq
+    mapM_ takeMVar flushes
+    print $ length refs
+
 
 
