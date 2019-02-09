@@ -43,7 +43,7 @@ import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
 import           Control.Monad.Reader (ReaderT(..), ask)
-import           Control.Monad.State.Strict (StateT(..), modify, get, put, execStateT)
+import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT)
 import           Control.Monad.Identity (Identity(..))
 import           Control.Monad.Random.Class (MonadRandom, getRandomR)
 import           Control.Monad (replicateM, forever)
@@ -114,7 +114,7 @@ data MMapped = MMapped !StoredOffsets !ByteString
 
 data WriteQueue = WriteQueue (Chan (WEnqueued (MVar Flushed) (MVar Ref)))
 
-streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) m ()
+streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) m void
 streamWriteQ (WriteQueue q) = go
     where
     go = (liftIO $ readChan q) >>= \case
@@ -421,11 +421,11 @@ data DBState = DBState {
     dbReaders :: ReadCache,
     dbReaderExn :: Async Void,
     dbWriter :: WriteQueue,
-    dbWriterExn :: Async Segment
+    dbWriterExn :: Async Void
 }
 
-dbFinish :: DBState -> IO Segment
-dbFinish DBState{..} = snd <$> waitAny [fmap absurd dbReaderExn, dbWriterExn]
+dbFinish :: DBState -> IO Void
+dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
 loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
@@ -445,7 +445,7 @@ loadInitSeg filenameConfig status = case status of
                     return $ Write ref flushed bs
                 fakeWriteQ = SP.mapM fakeWrite entries
                 config = ConsumerConfig partialSeg (const (return ()))
-            () :> _savedOffs <- runHandleT (consumeFile config (hoist lift fakeWriteQ)) hdl
+            () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
             liftIO $ do
                 renameFile temporaryPath finalPath
                 removeFile partialPath
@@ -499,7 +499,7 @@ readViaReaders ref Readers{..} = do
 
 
 
-spawnWriter :: MVar (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Segment )
+spawnWriter :: MVar (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Void )
 spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
     let chunks = hoist lift $ splitWith @IO consumerLimits (streamWriteQ writeQ)
@@ -516,7 +516,7 @@ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
             seg <- get
             put (succ seg)
             liftIO $ writeSeg seg writes
-    exn <- async $ flip execStateT initSeg $ mapsM_ writeSegS chunks
+    exn <- async $ flip evalStateT initSeg $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
 spawnReaders :: Int -> Int -> ReaderConfig -> IO (Readers, Async exception)
