@@ -80,6 +80,7 @@ library:
   - lifted-async
   - binary-search
   - containers
+  - MonadRandom
   ghc-options:
   - -O2
   - -Wall

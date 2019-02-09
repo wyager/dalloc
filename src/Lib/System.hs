@@ -3,19 +3,20 @@ module Lib.System (demo) where
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Async (Async, async, link, waitAny, wait)
 -- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar)
+import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar)
 import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO)
 import           Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
+import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
-import           Data.Set as Set (Set, insert, member, empty)
+import           Data.Set as Set (Set, insert, member, empty, union, spanAntitone)
+import qualified Data.Set as Set (map)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Builder (Builder, byteString, hPutBuilder)
 import           Data.Foldable (toList)
-import           System.IO (Handle, hFlush, IOMode(AppendMode), openFile)
+import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile)
 import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
@@ -44,15 +45,16 @@ import           Data.Void (Void, absurd)
 import           Control.Monad.Reader (ReaderT(..), ask)
 import           Control.Monad.State.Strict (StateT(..), modify, get, put, execStateT)
 import           Control.Monad.Identity (Identity(..))
-import           Control.Monad (replicateM)
+import           Control.Monad.Random.Class (MonadRandom, getRandomR)
+import           Control.Monad (replicateM, forever)
 import           Data.Proxy (Proxy(Proxy))
 import           Data.Bits ((.&.), shiftL)
 
 newtype Segment = Segment Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded)
 
 newtype Ix = Ix Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded)
 
 newtype Offset = Offset Word64 
     deriving newtype (Eq, Ord, Store, Storable, Num, Show)
@@ -283,8 +285,17 @@ data IrrecoverableFailure
     | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
     | IFInitFailure InitFailure
     | IFSegmentStreamError SegmentStreamError
+    | IFGCError GCError
     deriving stock (Typeable, Show)
     deriving anyclass Exception
+
+
+newtype GCM a = GCM {runGCM :: IO a}
+    deriving newtype (Functor,Applicative,Monad,MonadIO)
+
+instance MultiError GCError               GCM where throw = liftIO . throwIO . IFGCError
+instance MultiError StoredOffsetsDecodeEx GCM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
+instance MultiError OffsetDecodeEx        GCM where throw = liftIO . throwIO . IFOffsetDecodeEx
 
 newtype DBM a = DBM {runDBM :: IO a}
     deriving newtype (Functor,Applicative,Monad,MonadIO)
@@ -426,7 +437,7 @@ loadInitSeg filenameConfig status = case status of
                 temporaryPath = partialPath ++ ".rebuild"
                 finalPath = segmentPath filenameConfig partialSeg
             partial <- liftIO $ mmapFileByteString partialPath Nothing
-            hdl <- liftIO $ openFile temporaryPath AppendMode 
+            hdl <- liftIO $ openFile temporaryPath WriteMode 
             let entries = streamBS partial
                 fakeWrite bs = do
                     ref <- liftIO newEmptyMVar
@@ -470,10 +481,6 @@ initialize FilenameConfig{..} = do
         _ -> throw IDon'tUnderstandSearchM
 
 
-data GcState = GcState {
-        roots :: Set Ref,
-        persistent :: Ref
-    }
 
 -- Sharded by segment hash
 data Readers = Readers {shardShift :: Int, 
@@ -501,7 +508,7 @@ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
             let filepath = partialSegmentPath filenameConfig seg
                 registerHotcache offsets = liftIO $ swapMVar hotCache (seg, offsets) >> return ()
                 consumeToHdl = consumeFile @(BufferT (HandleT IO)) (ConsumerConfig seg registerHotcache) (hoist (lift . lift) writes)
-            hdl <- openFile filepath AppendMode
+            hdl <- openFile filepath WriteMode
             renameFile filepath (segmentPath filenameConfig seg)
             () :> r <- runHandleT (runBufferT consumeToHdl) hdl
             return r
@@ -525,7 +532,45 @@ spawnReaders qLen shardShift cfg = do
         return impossible
     return (Readers shardShift queues, exception)
 
--- spawnGcManager :: 
+
+-- highestIx :: Set Ref -> 
+
+segBound :: Segment -> (Ref,Ref)
+segBound seg = (Ref seg minBound, Ref seg maxBound)
+
+setRange :: Ord a => a -> a -> Set a -> (Set a, Set a, Set a)
+setRange lo hi set = (tooLow, good, tooHigh)
+    where
+    (tooLow, feasible) = spanAntitone (< lo) set
+    (good, tooHigh) = spanAntitone (<= hi) set
+
+-- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
+-- wrt that segment) and passes it to the GC
+data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
+
+spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
+spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
+    where
+    peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
+                                | null currentIxes = undefined "Just save an empty segment"
+                                | otherwise = do
+                                    let old_filepath = segmentPath filenameConfig snapshotSegment
+                                    old_mmapped <- mmap old_filepath
+                                    let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
+                                        new_filepath = partialSegmentPath filenameConfig snapshotSegment
+                                    new_hdl <- liftIO $ openFile new_filepath WriteMode 
+                                    (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
+                                    new_mmapped <- mmap new_filepath
+                                    liftIO $ registerGC snapshotSegment new_mmapped
+                                    let olderRefs' = union olderRefs activeRefs
+                                    score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
+                                    if score < 0.1 || snapshotSegment == minBound
+                                        then return ()
+                                        else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
+
+        where
+        (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
+        currentIxes = Set.map refIx currentRefs
 
 
 data ReadCache = ReadCache {
@@ -534,6 +579,16 @@ data ReadCache = ReadCache {
         hot :: MVar (Segment, Map Offset ByteString)
     }
 
+
+readViaReadCache :: Ref -> ReadCache -> IO (Async ByteString)
+readViaReadCache ref ReadCache{..} = async $ do
+    (hotSegment, hotcache) <- readMVar hot
+    if hotSegment == refSegment ref
+        then return $ snd (Map.elemAt (fromEnum $ refIx ref) hotcache)
+        else do
+            readVar <- readViaReaders ref readers
+            takeMVar readVar
+
 data ConsumerLimits = ConsumerLimits {
         cutoffCount :: Int,
         cutoffLength :: Offset
@@ -541,7 +596,6 @@ data ConsumerLimits = ConsumerLimits {
 
 exceeds :: (Int, Offset) -> ConsumerLimits -> Bool
 (count,len) `exceeds` ConsumerLimits{..} = count >= cutoffCount || len >= cutoffLength
-
 
 
 splitAfter :: forall x a m r . Monad m => (x -> a -> x) -> x -> (x -> Bool) -> Stream (Of a) m r -> Stream (Stream (Of a) m) m r
@@ -610,6 +664,9 @@ instance MonadIO m => Writable (HandleT m) where
     writeMB bd = HandleT $ ask >>= \hdl -> liftIO (hPutBuilder hdl bd)
     flushM = HandleT $ ask >>= \hdl -> liftIO (hFlush hdl)
 
+instance MultiError e m => MultiError e (HandleT m) where
+    throw = lift . throw
+
 
 newtype BufferT m a = BufferT (StateT Builder m a)
     deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
@@ -624,6 +681,9 @@ instance Writable m => Writable (BufferT m) where
         lift $ writeMB builder
         lift $ flushM
         put mempty
+
+instance MultiError e m => MultiError e (BufferT m) where
+    throw = lift . throw
 
 runBufferT :: Writable m => BufferT m a -> m a
 runBufferT (BufferT state) = do
@@ -790,15 +850,15 @@ consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
 class MonadVar var m where
     putVar :: var a -> a -> m ()
-    newEmptyVar :: m (var a)
+    -- newEmptyVar :: m (var a)
 
 instance MonadIO m => MonadVar MVar m where
     putVar var = liftIO . putMVar var
-    newEmptyVar = liftIO newEmptyMVar
+    -- newEmptyVar = liftIO newEmptyMVar
 
 instance MonadVar Proxy Identity where
     putVar _ _ = return ()
-    newEmptyVar = return Proxy
+    -- newEmptyVar = return Proxy
 
 {-# INLINE saveFile #-}
 saveFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerAction (var Flushed) (var Ref) -> m ()
