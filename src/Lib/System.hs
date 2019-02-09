@@ -1,4 +1,4 @@
-module Lib.System  where
+module Lib.System (demo) where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Async (Async, async, link, waitAny, wait)
@@ -9,6 +9,7 @@ import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO)
 import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, newTBMChanIO, readTBMChan)
 import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan, newTBChanIO)
+import           Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import           Control.Concurrent.STM (atomically)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
 import qualified Data.Map.Strict as Map (toList)
@@ -111,17 +112,17 @@ data WEnqueued flushed ref
 
 data MMapped = MMapped !StoredOffsets !ByteString
 
-data WriteQueue = WriteQueue (TBMChan (WEnqueued (MVar Flushed) (MVar Ref)))
+data WriteQueue = WriteQueue (Chan (WEnqueued (MVar Flushed) (MVar Ref)))
 
 streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) m ()
 streamWriteQ (WriteQueue q) = go
     where
-    go = (liftIO $ atomically $ readTBMChan q) >>= \case
-        Nothing -> return ()
-        Just thing -> yield thing >> go
+    go = (liftIO $ readChan q) >>= \case
+        -- Nothing -> return ()
+        {- Just -} thing -> yield thing >> go
 
 newWriteQueueIO :: Int -> IO WriteQueue
-newWriteQueueIO maxLen = WriteQueue <$> newTBMChanIO maxLen
+newWriteQueueIO _maxLen = WriteQueue <$> newChan
 
 data REnqueued = Read !Ref !(MVar ByteString)
                | ReadComplete !Segment !MMapped
@@ -138,12 +139,12 @@ storeToQueue (WriteQueue q) value = async $ do
     bs <- evaluate $ force $ encode $ sized value
     saved <- newEmptyMVar
     flushed <- newEmptyMVar
-    atomically $ writeTBMChan q $ Write saved flushed bs
+    writeChan q $ Write saved flushed bs
     ref <- takeMVar saved
     return (ref, flushed)
 
 flushWriteQueue :: WriteQueue -> IO ()
-flushWriteQueue (WriteQueue q) = atomically $ writeTBMChan q $ Tick
+flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
 
 mmap :: (MonadIO m, Throws '[StoredOffsetsDecodeEx] m) => FilePath -> m MMapped
@@ -590,10 +591,12 @@ class Monad m => Writable m where
     flushM :: m ()
 
 instance MonadIO m => Writable (ReaderT Handle m) where
+    {-# INLINE writeM #-}
     writeM bs = ask >>= \hdl -> liftIO (ByteString.hPut hdl bs)
     flushM = ask >>= \hdl -> liftIO (hFlush hdl)
 
 instance Monad m => Writable (StateT Builder m) where
+    {-# INLINE writeM #-}
     writeM bs = modify (<> byteString bs)
     flushM = return ()
 
@@ -737,7 +740,7 @@ consume' state@ConsumerState{..} = \case
         (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue},
             WriteToLog bs entries' refVar ix)
 
-
+{-# INLINE consumeFile #-}
 consumeFile :: forall m var r . (MonadVar var m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (var Flushed) (var Ref))) m r -> m (Of () r)
 consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
@@ -754,6 +757,7 @@ instance MonadVar Proxy Identity where
     putVar _ _ = return ()
     newEmptyVar = return Proxy
 
+{-# INLINE saveFile #-}
 saveFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerAction (var Flushed) (var Ref) -> m ()
 saveFile ConsumerConfig{..} action = case action of
         Flush flushed -> do
@@ -791,7 +795,7 @@ demo = do
     let cfg = defaultDBConfig "/tmp/rundir"
     state <- runDBM (setup cfg)
     let wq = dbWriter state
-    writes <- replicateM (16*1024) (storeToQueue wq (ByteString.replicate 4096 0x44))
+    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
     (refs,flushes) <- unzip <$> mapM wait writes
     flushWriteQueue wq
     mapM_ takeMVar flushes

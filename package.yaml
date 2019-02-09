@@ -83,7 +83,7 @@ library:
   ghc-options:
   - -O2
   - -Wall
-  - -Werror
+  # - -Werror
 
 executables:
   dalloc-exe:
