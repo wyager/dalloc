@@ -3,20 +3,17 @@ module Lib.System (demo) where
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Async (Async, async, link, waitAny, wait)
 -- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
+import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar)
 import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO)
-import           Control.Concurrent.STM.TBMChan (TBMChan, writeTBMChan, newTBMChanIO, readTBMChan)
-import           Control.Concurrent.STM.TBChan (TBChan, writeTBChan, readTBChan, newTBChanIO)
 import           Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
-import           Control.Concurrent.STM (atomically)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey)
 import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
-import           Data.ByteString.Builder (Builder, byteString)
+import           Data.ByteString.Builder (Builder, byteString, hPutBuilder)
 import           Data.Foldable (toList)
 import           System.IO (Handle, hFlush, IOMode(AppendMode), openFile)
 import           System.IO.MMap (mmapFileByteString)
@@ -26,7 +23,7 @@ import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector as V
 import           Data.LruCache as Lru (LruCache, empty, lookup, insertView)
-import           Data.Hashable (Hashable)
+import           Data.Hashable (Hashable, hash)
 import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
@@ -35,7 +32,7 @@ import qualified Streaming.Prelude as SP (mapM)
 import           Streaming (wrap, mapsM_)
 import           Data.Functor.Of (Of((:>)))
 import           Control.Monad.Trans.Class (lift)
-import           Control.Monad.Morph (hoist)
+import           Control.Monad.Morph (MonadTrans, hoist)
 import           Numeric.Search.Range (searchFromTo)
 import           Numeric.Search (searchM, divForever, hiVal)
 -- import           Control.Monad.Error.Class (MonadError, throwError)
@@ -49,6 +46,7 @@ import           Control.Monad.State.Strict (StateT(..), modify, get, put, execS
 import           Control.Monad.Identity (Identity(..))
 import           Control.Monad (replicateM)
 import           Data.Proxy (Proxy(Proxy))
+import           Data.Bits ((.&.), shiftL)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum)
@@ -129,10 +127,10 @@ data REnqueued = Read !Ref !(MVar ByteString)
                | ReadExn StoredOffsetsDecodeEx
                | SegmentWasGCed !Segment !MMapped -- The new segment (mmapped)
 
-data ReadQueue = ReadQueue (TBChan REnqueued)
+data ReadQueue = ReadQueue (Chan REnqueued)
 
 readQueue :: Int -> IO ReadQueue
-readQueue maxLen = ReadQueue <$> newTBChanIO maxLen
+readQueue _maxLen = ReadQueue <$> newChan
 
 storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, MVar Flushed))
 storeToQueue (WriteQueue q) value = async $ do
@@ -316,7 +314,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
     where
     initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
     go state = do
-        enqueued <- liftIO $ atomically $ readTBChan q
+        enqueued <- liftIO $ readChan q
         (state', toDispatch) <- readerStep state enqueued
         case toDispatch of
             Nothing -> return ()
@@ -327,7 +325,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
                     let toSend = case loaded of
                             Right offsets -> ReadComplete seg $ MMapped offsets bs
                             Left exn -> ReadExn exn
-                    atomically $ writeTBChan q toSend 
+                    writeChan q toSend 
                 link serializer -- Should be exn-free, but just in case
         go state'
         
@@ -409,7 +407,7 @@ defaultDBConfig rundir = DBConfig{..}
 
 
 data DBState = DBState {
-    dbReaders :: Readers,
+    dbReaders :: ReadCache,
     dbReaderExn :: Async Void,
     dbWriter :: WriteQueue,
     dbWriterExn :: Async Segment
@@ -436,7 +434,7 @@ loadInitSeg filenameConfig status = case status of
                     return $ Write ref flushed bs
                 fakeWriteQ = SP.mapM fakeWrite entries
                 config = ConsumerConfig partialSeg (const (return ()))
-            () :> _savedOffs <- runReaderT (consumeFile config (hoist lift fakeWriteQ)) hdl
+            () :> _savedOffs <- runHandleT (consumeFile config (hoist lift fakeWriteQ)) hdl
             liftIO $ do
                 renameFile temporaryPath finalPath
                 removeFile partialPath
@@ -447,8 +445,9 @@ setup DBConfig{..} = do
     status <- initialize filenameConfig
     initSeg <- loadInitSeg filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
-    (writer, writerExn) <- liftIO $ spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits
-    return $ DBState readers readersExn writer writerExn
+    hotCache <- liftIO $ newEmptyMVar
+    (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
+    return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
@@ -471,11 +470,6 @@ initialize FilenameConfig{..} = do
         _ -> throw IDon'tUnderstandSearchM
 
 
-data CoreState = CoreState {
-        coreCollector :: TVar GcState,
-        coreReaders :: ReadCache
-    }
-
 data GcState = GcState {
         roots :: Set Ref,
         persistent :: Ref
@@ -485,19 +479,31 @@ data GcState = GcState {
 data Readers = Readers {shardShift :: Int, 
                         shards :: V.Vector ReadQueue}
 
+readViaReaders :: Ref -> Readers -> IO (MVar ByteString)
+readViaReaders ref Readers{..} = do
+    let segHash = hash (refSegment ref)
+        mask = (1 `shiftL` shardShift) - 1
+        hash' = segHash .&. mask
+        ReadQueue rq = shards V.! hash'
+    readVar <- newEmptyMVar
+    writeChan rq $ Read ref readVar
+    return readVar
 
-spawnWriter :: Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Segment )
-spawnWriter maxWriteQueueLen initSeg filenameConfig consumerLimits = do
+
+
+
+spawnWriter :: MVar (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Segment )
+spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
     let chunks = hoist lift $ splitWith @IO consumerLimits (streamWriteQ writeQ)
         writeSeg :: Segment -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) IO x -> IO x
         writeSeg seg writes = do
             let filepath = partialSegmentPath filenameConfig seg
+                registerHotcache offsets = liftIO $ swapMVar hotCache (seg, offsets) >> return ()
+                consumeToHdl = consumeFile @(BufferT (HandleT IO)) (ConsumerConfig seg registerHotcache) (hoist (lift . lift) writes)
             hdl <- openFile filepath AppendMode
-            let registerHotcache _offsets = return () -- NB TODO: Actually use the ReadCache
-                consumeToHdl = consumeFile @(ReaderT Handle IO) (ConsumerConfig seg registerHotcache) (hoist lift writes)
             renameFile filepath (segmentPath filenameConfig seg)
-            () :> r <- runReaderT consumeToHdl hdl
+            () :> r <- runHandleT (runBufferT consumeToHdl) hdl
             return r
         writeSegS writes = do
             seg <- get
@@ -524,8 +530,8 @@ spawnReaders qLen shardShift cfg = do
 
 data ReadCache = ReadCache {
         readers :: Readers,
-        -- Everyone has to read this for every read. Seems bad. But weak IORef MM causes issues
-        hot :: TVar (Segment,Map Offset ByteString)
+        -- Everyone has to read this for every read. Seems bad. Weak IORef MM causes issues, must use something with strong MM (like MVar)
+        hot :: MVar (Segment, Map Offset ByteString)
     }
 
 data ConsumerLimits = ConsumerLimits {
@@ -588,18 +594,55 @@ data SegGcState = SegGcState {
 
 class Monad m => Writable m where
     writeM :: ByteString -> m ()
+    writeMB :: Builder -> m ()
     flushM :: m ()
 
-instance MonadIO m => Writable (ReaderT Handle m) where
-    {-# INLINE writeM #-}
-    writeM bs = ask >>= \hdl -> liftIO (ByteString.hPut hdl bs)
-    flushM = ask >>= \hdl -> liftIO (hFlush hdl)
+newtype HandleT m a = HandleT (ReaderT Handle m a) 
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
 
-instance Monad m => Writable (StateT Builder m) where
+runHandleT :: HandleT m a -> Handle -> m a
+runHandleT (HandleT reader) handle = runReaderT reader handle
+
+instance MonadIO m => Writable (HandleT m) where
     {-# INLINE writeM #-}
-    writeM bs = modify (<> byteString bs)
+    writeM bs = HandleT $ ask >>= \hdl -> liftIO (ByteString.hPut hdl bs)
+    {-# INLINE writeMB #-}
+    writeMB bd = HandleT $ ask >>= \hdl -> liftIO (hPutBuilder hdl bd)
+    flushM = HandleT $ ask >>= \hdl -> liftIO (hFlush hdl)
+
+
+newtype BufferT m a = BufferT (StateT Builder m a)
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
+
+instance Writable m => Writable (BufferT m) where
+    {-# INLINE writeM #-}
+    writeM bs = BufferT $ modify (<> byteString bs)
+    {-# INLINE writeMB #-}
+    writeMB bd = BufferT $ modify (<> bd)
+    flushM = BufferT $ do
+        builder <- get
+        lift $ writeMB builder
+        lift $ flushM
+        put mempty
+
+runBufferT :: Writable m => BufferT m a -> m a
+runBufferT (BufferT state) = do
+        (a,builder) <- runStateT state mempty
+        writeMB builder
+        return a
+
+newtype DummyFileT m a = DummyFileT (StateT Builder m a)
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
+
+instance Monad m => Writable (DummyFileT m) where
+    {-# INLINE writeM #-}
+    writeM bs = DummyFileT $ modify (<> byteString bs)
+    {-# INLINE writeMB #-}
+    writeMB bd = DummyFileT $ modify (<> bd)
     flushM = return ()
 
+runDummyFileT :: DummyFileT m a -> m (a, Builder)
+runDummyFileT (DummyFileT state) = runStateT state mempty
 
 gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => GcConfig ByteString -> Segment -> Set Ix -> PersistenceStatus -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
 gc cfg thisSegment live perst = fmap unwrap . repackFile . gc' cfg thisSegment live perst . streamSegFromOffsets Desc
