@@ -1,14 +1,15 @@
 module Main (main) where
 
 import Lib.System (demo)
+main :: IO ()
+main = demo
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
 -- import           Control.Concurrent.STM (atomically)
 -- import Control.Concurrent (forkIO)
 
-main :: IO ()
-main = demo
+
 
 -- import Lib
 -- import Lib.Writer as W

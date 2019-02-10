@@ -1,12 +1,12 @@
 module Lib.System (demo) where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
-import           Control.Concurrent.Async (Async, async, link, waitAny, wait)
+import           Control.Concurrent.Async (Async, async, link, waitAny, wait, waitCatch)
 -- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar)
-import           Control.Concurrent.STM.TVar (TVar)
+import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar)
+-- import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
-import           Control.Exception (Exception,evaluate, throwIO)
+import           Control.Exception (Exception,evaluate, throwIO, SomeException, catch)
 import           Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
@@ -456,7 +456,7 @@ setup DBConfig{..} = do
     status <- initialize filenameConfig
     initSeg <- loadInitSeg filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
-    hotCache <- liftIO $ newEmptyMVar
+    hotCache <- liftIO $ newMVar (initSeg, mempty)
     (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
@@ -495,8 +495,6 @@ readViaReaders ref Readers{..} = do
     readVar <- newEmptyMVar
     writeChan rq $ Read ref readVar
     return readVar
-
-
 
 
 spawnWriter :: MVar (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Void )
@@ -903,6 +901,7 @@ demo = do
     flushWriteQueue wq
     mapM_ takeMVar flushes
     print $ length refs
+
 
 
 
