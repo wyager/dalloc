@@ -81,6 +81,9 @@ library:
   - binary-search
   - containers
   - MonadRandom
+  - concurrency
+  - dejafu
+  - exceptions
   ghc-options:
   - -O2
   - -Wall

@@ -1,13 +1,14 @@
-module Lib.System (demo) where
+{-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
+module Lib.System where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
-import           Control.Concurrent.Async (Async, async, link, waitAny, wait, waitCatch)
+import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait, waitCatch)
 -- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar)
+import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar)
 -- import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO, SomeException, catch)
-import           Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
+import           Control.Concurrent.Classy.Chan (Chan, newChan, readChan, writeChan)
 import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty, union, spanAntitone)
@@ -49,6 +50,8 @@ import           Control.Monad.Random.Class (MonadRandom, getRandomR)
 import           Control.Monad (replicateM, forever)
 import           Data.Proxy (Proxy(Proxy))
 import           Data.Bits ((.&.), shiftL)
+import           Control.Concurrent.Classy (MonadConc)
+import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded)
@@ -112,38 +115,43 @@ data WEnqueued flushed ref
 
 data MMapped = MMapped !StoredOffsets !ByteString
 
-data WriteQueue = WriteQueue (Chan (WEnqueued (MVar Flushed) (MVar Ref)))
+data WriteQueue m  = WriteQueue (Chan m (WEnqueued (MVar m Flushed) (MVar m Ref)))
 
-streamWriteQ :: MonadIO m => WriteQueue -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) m void
+
+streamWriteQ :: MonadConc m => WriteQueue m -> Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m void
 streamWriteQ (WriteQueue q) = go
     where
-    go = (liftIO $ readChan q) >>= \case
-        -- Nothing -> return ()
-        {- Just -} thing -> yield thing >> go
+    go = lift (readChan q) >>= yield >> go
 
-newWriteQueueIO :: Int -> IO WriteQueue
+newWriteQueueIO :: MonadConc m => Int -> m (WriteQueue m)
 newWriteQueueIO _maxLen = WriteQueue <$> newChan
 
-data REnqueued = Read !Ref !(MVar ByteString)
-               | ReadComplete !Segment !MMapped
-               | ReadExn StoredOffsetsDecodeEx
-               | SegmentWasGCed !Segment !MMapped -- The new segment (mmapped)
+data REnqueued m = Read !Ref !(MVar m ByteString)
+                | ReadComplete !Segment !MMapped
+                | ReadExn StoredOffsetsDecodeEx
+                | SegmentWasGCed !Segment !MMapped -- The new segment (mmapped)
 
-data ReadQueue = ReadQueue (Chan REnqueued)
+data ReadQueue m = ReadQueue (Chan m (REnqueued m))
 
-readQueue :: Int -> IO ReadQueue
+class Monad m => MonadEvaluate m where
+    evaluateM :: a -> m a
+
+instance MonadEvaluate IO where
+    evaluateM = evaluate
+
+readQueue :: MonadConc m => Int -> m (ReadQueue m)
 readQueue _maxLen = ReadQueue <$> newChan
 
-storeToQueue :: Store a => WriteQueue -> a -> IO (Async (Ref, MVar Flushed))
+storeToQueue :: (Store a, MonadConc m, MonadEvaluate m) => WriteQueue m -> a -> m (Async m (Ref, MVar m Flushed))
 storeToQueue (WriteQueue q) value = async $ do
-    bs <- evaluate $ force $ encode $ sized value
+    bs <- evaluateM $ force $ encode $ sized value
     saved <- newEmptyMVar
     flushed <- newEmptyMVar
     writeChan q $ Write saved flushed bs
     ref <- takeMVar saved
     return (ref, flushed)
 
-flushWriteQueue :: WriteQueue -> IO ()
+flushWriteQueue :: MonadConc m => WriteQueue m -> m ()
 flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
 
@@ -154,10 +162,10 @@ mmap path = do
     return (MMapped offs bs)
 
 
--- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
+-- -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
-data ReaderConfig = ReaderConfig {
-        openSeg     :: Segment -> IO ByteString,
+data ReaderConfig m = ReaderConfig {
+        openSeg     :: Segment -> m ByteString,
         lruSize     :: Int,
         maxOpenSegs :: Int
     }
@@ -256,10 +264,10 @@ readSegCache cache@SegmentCache{..} (Ref seg ix) =
             return $ Just (value, cache {openSegments = open'})
 
 
-data ReaderState = ReaderState {
+data ReaderState m = ReaderState {
     cached :: LruCache Ref ByteString,
     segmentCache :: SegmentCache,
-    pending :: Map Segment (Map Ix [MVar ByteString])
+    pending :: Map Segment (Map Ix [MVar m ByteString])
 }  
 
 data Found a = NoK1 | NoK2 | Found a
@@ -320,19 +328,19 @@ instance Monad m => MultiError InitFailure            (MockDBMT m) where throw =
 instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = MockDBMT . throwError . IFSegmentStreamError
 
 
-reader :: (MonadIO m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig -> ReadQueue -> m void
+reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig m -> ReadQueue m -> m void
 reader ReaderConfig{..} (ReadQueue q) = go initial
     where
     initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
     go state = do
-        enqueued <- liftIO $ readChan q
+        enqueued <- readChan q
         (state', toDispatch) <- readerStep state enqueued
         case toDispatch of
             Nothing -> return ()
-            Just seg -> liftIO $ do
+            Just seg -> do
                 serializer <- async $ do
                     bs <- openSeg seg
-                    loaded <- evaluate $ force $ loadOffsets bs
+                    loaded <- evaluateM $ force $ loadOffsets bs
                     let toSend = case loaded of
                             Right offsets -> ReadComplete seg $ MMapped offsets bs
                             Left exn -> ReadExn exn
@@ -344,17 +352,17 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
 
 data ReaderConsistencyError = ReadCompletedButNoOneCared Segment deriving Show
 
-readerStep :: (MonadIO m, Throws '[IndexError, OffsetDecodeEx, StoredOffsetsDecodeEx, CacheConsistencyError, ReaderConsistencyError] m) => ReaderState -> REnqueued -> m (ReaderState, Maybe Segment)
+readerStep :: (MonadConc m, Throws '[IndexError, OffsetDecodeEx, StoredOffsetsDecodeEx, CacheConsistencyError, ReaderConsistencyError] m) => ReaderState m -> REnqueued m -> m (ReaderState m, Maybe Segment)
 readerStep state@ReaderState{..} = \case
     Read ref@(Ref seg ix) done -> case Lru.lookup ref cached of
         Just (string, cached') -> do
-            liftIO $ putMVar done string
+            putMVar done string
             return (state {cached = cached'}, Nothing)
         Nothing -> do
             cachedRef <- readSegCache segmentCache ref
             case cachedRef of
                 Just (string, cache') -> do
-                    liftIO $ putMVar done string
+                    putMVar done string
                     return (state {segmentCache = cache'}, Nothing)
                 Nothing -> do
                     let (pending', waiting) = appsert (maybe [done] (done:)) seg ix pending
@@ -372,7 +380,7 @@ readerStep state@ReaderState{..} = \case
                 let cache' = insertSegment seg mmapped segmentCache
                     clear ix dones = do
                         value <- readSeg mmapped ix 
-                        mapM_ (\done -> liftIO $ putMVar done value) dones
+                        mapM_ (`putMVar` value) dones
                 _ <- Map.traverseWithKey clear waiting
                 return (state {pending = pending', segmentCache = cache'}, Nothing)
     SegmentWasGCed seg mmapped -> 
@@ -386,17 +394,17 @@ data FilenameConfig = FilenameConfig {
     }
 
 
-data DBConfig = DBConfig {
+data DBConfig m = DBConfig {
         filenameConfig :: FilenameConfig,
         maxWriteQueueLen :: Int,
         maxReadQueueLen :: Int,
         readQueueShardShift :: Int,
-        readerConfig :: ReaderConfig,
+        readerConfig :: ReaderConfig m,
         consumerLimits :: ConsumerLimits
     }
 
-defaultDBConfig :: FilePath -> DBConfig
-defaultDBConfig rundir = DBConfig{..}
+defaultDBConfig :: (Segment -> m ByteString) -> FilePath -> DBConfig m
+defaultDBConfig openSeg rundir = DBConfig{..}
     where
     segPath seg = rundir ++ "/" ++ show seg
     filenameConfig = FilenameConfig {
@@ -407,7 +415,7 @@ defaultDBConfig rundir = DBConfig{..}
     maxReadQueueLen = 16
     readQueueShardShift = 0
     readerConfig = ReaderConfig {
-            openSeg = (\seg -> mmapFileByteString (segPath seg) Nothing),
+            openSeg = openSeg, -- (\seg -> mmapFileByteString (segPath seg) Nothing),
             lruSize = 16,
             maxOpenSegs = 16
         }
@@ -417,48 +425,48 @@ defaultDBConfig rundir = DBConfig{..}
         }
 
 
-data DBState = DBState {
-    dbReaders :: ReadCache,
-    dbReaderExn :: Async Void,
-    dbWriter :: WriteQueue,
-    dbWriterExn :: Async Void
+data DBState m = DBState {
+    dbReaders :: ReadCache m,
+    dbReaderExn :: Async m Void,
+    dbWriter :: WriteQueue m,
+    dbWriterExn :: Async m Void
 }
 
-dbFinish :: DBState -> IO Void
+dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
-loadInitSeg filenameConfig status = case status of
-        NoData -> return (Segment 0)
-        CleanShutdown highestSeg -> return (succ highestSeg)
-        AbruptShutdown partialSeg -> do
-            let partialPath = partialSegmentPath filenameConfig partialSeg
-                temporaryPath = partialPath ++ ".rebuild"
-                finalPath = segmentPath filenameConfig partialSeg
-            partial <- liftIO $ mmapFileByteString partialPath Nothing
-            hdl <- liftIO $ openFile temporaryPath WriteMode 
-            let entries = streamBS partial
-                fakeWrite bs = do
-                    ref <- liftIO newEmptyMVar
-                    flushed <- liftIO newEmptyMVar
-                    return $ Write ref flushed bs
-                fakeWriteQ = SP.mapM fakeWrite entries
-                config = ConsumerConfig partialSeg (const (return ()))
-            () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
-            liftIO $ do
-                renameFile temporaryPath finalPath
-                removeFile partialPath
-            return (succ partialSeg)
+-- loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
+-- loadInitSeg filenameConfig status = case status of
+--         NoData -> return (Segment 0)
+--         CleanShutdown highestSeg -> return (succ highestSeg)
+--         AbruptShutdown partialSeg -> do
+--             let partialPath = partialSegmentPath filenameConfig partialSeg
+--                 temporaryPath = partialPath ++ ".rebuild"
+--                 finalPath = segmentPath filenameConfig partialSeg
+--             partial <- liftIO $ mmapFileByteString partialPath Nothing
+--             hdl <- liftIO $ openFile temporaryPath WriteMode 
+--             let entries = streamBS partial
+--                 fakeWrite bs = do
+--                     ref <- liftIO newEmptyMVar
+--                     flushed <- liftIO newEmptyMVar
+--                     return $ Write ref flushed bs
+--                 fakeWriteQ = SP.mapM fakeWrite entries
+--                 config = ConsumerConfig partialSeg (const (return ()))
+--             () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
+--             liftIO $ do
+--                 renameFile temporaryPath finalPath
+--                 removeFile partialPath
+--             return (succ partialSeg)
 
-setup :: DBConfig -> DBM DBState
-setup DBConfig{..} = do
-    status <- initialize filenameConfig
-    initSeg <- loadInitSeg filenameConfig status
-    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
-    hotCache <- liftIO $ newMVar (initSeg, mempty)
-    (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
-    return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
+-- setup :: DBConfig -> DBM DBState
+-- setup DBConfig{..} = do
+--     status <- initialize filenameConfig
+--     initSeg <- loadInitSeg filenameConfig status
+--     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
+--     hotCache <- liftIO $ newMVar (initSeg, mempty)
+--     (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
+--     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
@@ -482,11 +490,11 @@ initialize FilenameConfig{..} = do
 
 
 
--- Sharded by segment hash
-data Readers = Readers {shardShift :: Int, 
-                        shards :: V.Vector ReadQueue}
+-- -- Sharded by segment hash
+data Readers m = Readers {shardShift :: Int, 
+                          shards :: V.Vector (ReadQueue m)}
 
-readViaReaders :: Ref -> Readers -> IO (MVar ByteString)
+readViaReaders :: MonadConc m => Ref -> Readers m -> m (MVar m ByteString)
 readViaReaders ref Readers{..} = do
     let segHash = hash (refSegment ref)
         mask = (1 `shiftL` shardShift) - 1
@@ -497,15 +505,16 @@ readViaReaders ref Readers{..} = do
     return readVar
 
 
-spawnWriter :: MVar (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue, Async Void )
+spawnWriter :: MVar IO (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue IO, Async IO Void )
 spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
     let chunks = hoist lift $ splitWith @IO consumerLimits (streamWriteQ writeQ)
-        writeSeg :: Segment -> Stream (Of (WEnqueued (MVar Flushed) (MVar Ref))) IO x -> IO x
+        writeSeg :: Segment -> Stream (Of (WEnqueued (MVar IO Flushed) (MVar IO Ref))) IO x -> IO x
         writeSeg seg writes = do
             let filepath = partialSegmentPath filenameConfig seg
-                registerHotcache offsets = liftIO $ swapMVar hotCache (seg, offsets) >> return ()
-                consumeToHdl = consumeFile @(BufferT (HandleT IO)) (ConsumerConfig seg registerHotcache) (hoist (lift . lift) writes)
+                registerHotcache :: Map Offset ByteString -> IO ()
+                registerHotcache offsets = swapMVar @IO hotCache (seg, offsets) >> return ()
+                consumeToHdl = consumeFile @(BufferT (HandleT IO)) (ConsumerConfig seg (lift . lift . registerHotcache)) (hoist (lift . lift) writes)
             hdl <- openFile filepath WriteMode
             renameFile filepath (segmentPath filenameConfig seg)
             () :> r <- runHandleT (runBufferT consumeToHdl) hdl
@@ -517,11 +526,12 @@ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     exn <- async $ flip evalStateT initSeg $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
-spawnReaders :: Int -> Int -> ReaderConfig -> IO (Readers, Async exception)
+spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) 
+             => Int -> Int -> ReaderConfig m -> m (Readers m, Async m exception)
 spawnReaders qLen shardShift cfg = do
     let spawn = do
             readQ <- readQueue qLen
-            thread <- async $ runDBM $ reader cfg readQ
+            thread <- async $ reader cfg readQ
             return (readQ, thread)
     spawned <- V.replicateM (2 ^ shardShift) spawn 
     let (queues, threads) = V.unzip spawned
@@ -531,54 +541,54 @@ spawnReaders qLen shardShift cfg = do
     return (Readers shardShift queues, exception)
 
 
--- highestIx :: Set Ref -> 
+-- -- highestIx :: Set Ref -> 
 
-segBound :: Segment -> (Ref,Ref)
-segBound seg = (Ref seg minBound, Ref seg maxBound)
+-- segBound :: Segment -> (Ref,Ref)
+-- segBound seg = (Ref seg minBound, Ref seg maxBound)
 
-setRange :: Ord a => a -> a -> Set a -> (Set a, Set a, Set a)
-setRange lo hi set = (tooLow, good, tooHigh)
-    where
-    (tooLow, feasible) = spanAntitone (< lo) set
-    (good, tooHigh) = spanAntitone (<= hi) set
+-- setRange :: Ord a => a -> a -> Set a -> (Set a, Set a, Set a)
+-- setRange lo hi set = (tooLow, good, tooHigh)
+--     where
+--     (tooLow, feasible) = spanAntitone (< lo) set
+--     (good, tooHigh) = spanAntitone (<= hi) feasible
 
 -- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
 -- wrt that segment) and passes it to the GC
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
 
-spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
-spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
-    where
-    peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
-                                | null currentIxes = undefined "Just save an empty segment"
-                                | otherwise = do
-                                    let old_filepath = segmentPath filenameConfig snapshotSegment
-                                    old_mmapped <- mmap old_filepath
-                                    let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
-                                        new_filepath = partialSegmentPath filenameConfig snapshotSegment
-                                    new_hdl <- liftIO $ openFile new_filepath WriteMode 
-                                    (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
-                                    new_mmapped <- mmap new_filepath
-                                    liftIO $ registerGC snapshotSegment new_mmapped
-                                    let olderRefs' = union olderRefs activeRefs
-                                    score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
-                                    if score < 0.1 || snapshotSegment == minBound
-                                        then return ()
-                                        else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
+-- spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
+-- spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
+--     where
+--     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
+--                                 | null currentIxes = undefined "Just save an empty segment"
+--                                 | otherwise = do
+--                                     let old_filepath = segmentPath filenameConfig snapshotSegment
+--                                     old_mmapped <- mmap old_filepath
+--                                     let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
+--                                         new_filepath = partialSegmentPath filenameConfig snapshotSegment
+--                                     new_hdl <- liftIO $ openFile new_filepath WriteMode 
+--                                     (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
+--                                     new_mmapped <- mmap new_filepath
+--                                     liftIO $ registerGC snapshotSegment new_mmapped
+--                                     let olderRefs' = union olderRefs activeRefs
+--                                     score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
+--                                     if score < 0.1 || snapshotSegment == minBound
+--                                         then return ()
+--                                         else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
 
-        where
-        (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
-        currentIxes = Set.map refIx currentRefs
+--         where
+--         (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
+--         currentIxes = Set.map refIx currentRefs
 
 
-data ReadCache = ReadCache {
-        readers :: Readers,
+data ReadCache m = ReadCache {
+        readers :: Readers m,
         -- Everyone has to read this for every read. Seems bad. Weak IORef MM causes issues, must use something with strong MM (like MVar)
-        hot :: MVar (Segment, Map Offset ByteString)
+        hot :: MVar m (Segment, Map Offset ByteString)
     }
 
 
-readViaReadCache :: Ref -> ReadCache -> IO (Async ByteString)
+readViaReadCache :: MonadConc m => Ref -> ReadCache m -> m (Async m ByteString)
 readViaReadCache ref ReadCache{..} = async $ do
     (hotSegment, hotcache) <- readMVar hot
     if hotSegment == refSegment ref
@@ -650,7 +660,7 @@ class Monad m => Writable m where
     flushM :: m ()
 
 newtype HandleT m a = HandleT (ReaderT Handle m a) 
-    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans, MonadConc, MonadThrow, MonadCatch, MonadMask)
 
 runHandleT :: HandleT m a -> Handle -> m a
 runHandleT (HandleT reader) handle = runReaderT reader handle
@@ -667,7 +677,7 @@ instance MultiError e m => MultiError e (HandleT m) where
 
 
 newtype BufferT m a = BufferT (StateT Builder m a)
-    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans)
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans, MonadConc, MonadThrow, MonadCatch, MonadMask)
 
 instance Writable m => Writable (BufferT m) where
     {-# INLINE writeM #-}
@@ -795,7 +805,7 @@ segmentStep bs =
 
 data SegmentStreamError = RepeatedFinalizer deriving Show
 
--- no fundep m -> e
+-- -- no fundep m -> e
 class Monad m => MultiError e m where
     throw :: e -> m a
 
@@ -842,28 +852,28 @@ consume' state@ConsumerState{..} = \case
             WriteToLog bs entries' refVar ix)
 
 {-# INLINE consumeFile #-}
-consumeFile :: forall m var r . (MonadVar var m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (var Flushed) (var Ref))) m r -> m (Of () r)
+consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m r -> m (Of () r)
 consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
 
-class MonadVar var m where
-    putVar :: var a -> a -> m ()
-    -- newEmptyVar :: m (var a)
+-- class MonadVar var m where
+--     putVar :: var a -> a -> m ()
+--     -- newEmptyVar :: m (var a)
 
-instance MonadIO m => MonadVar MVar m where
-    putVar var = liftIO . putMVar var
-    -- newEmptyVar = liftIO newEmptyMVar
+-- instance MonadIO m => MonadVar MVar m where
+--     putVar var = liftIO . putMVar var
+--     -- newEmptyVar = liftIO newEmptyMVar
 
-instance MonadVar Proxy Identity where
-    putVar _ _ = return ()
-    -- newEmptyVar = return Proxy
+-- instance MonadVar Proxy Identity where
+--     putVar _ _ = return ()
+--     -- newEmptyVar = return Proxy
 
 {-# INLINE saveFile #-}
-saveFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerAction (var Flushed) (var Ref) -> m ()
+saveFile :: (MonadConc m, Writable m) => ConsumerConfig m -> ConsumerAction (MVar m Flushed) (MVar m Ref) -> m ()
 saveFile ConsumerConfig{..} action = case action of
         Flush flushed -> do
             flushM
-            mapM_ (`putVar` Flushed) flushed
+            mapM_ (`putMVar` Flushed) flushed
         WriteToLog bs entries refVar ix -> do
             writeM bs
             -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
@@ -871,7 +881,7 @@ saveFile ConsumerConfig{..} action = case action of
             -- someone could try to do a read that would fail.
             -- Can't use IORef - weak memory model. MVar should be fine. STM/MVar interaction OK?
             register entries
-            putVar refVar (Ref segment ix) 
+            putMVar refVar (Ref segment ix) 
         Nop -> return ()
 
 writeOffsetsTo :: Writable m => StoredOffsets -> m ()
@@ -884,23 +894,23 @@ writeOffsetsTo offsets = do
     writeM $ encode offsetsLen
     flushM
 
-finalizeFile :: (MonadVar var m, Writable m) => ConsumerConfig m -> ConsumerState (var Flushed) -> m ()
+finalizeFile :: (MonadConc m, Writable m) => ConsumerConfig m -> ConsumerState (MVar m Flushed) -> m ()
 finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     flushM
-    mapM_ (`putVar` Flushed) flushQueue
+    mapM_ (`putMVar` Flushed) flushQueue
     let offsets = OffsetVector (VS.fromList (keys entries))
     writeOffsetsTo offsets
 
-demo :: IO () 
-demo = do
-    let cfg = defaultDBConfig "/tmp/rundir"
-    state <- runDBM (setup cfg)
-    let wq = dbWriter state
-    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
-    (refs,flushes) <- unzip <$> mapM wait writes
-    flushWriteQueue wq
-    mapM_ takeMVar flushes
-    print $ length refs
+-- demo :: IO () 
+-- demo = do
+--     let cfg = defaultDBConfig "/tmp/rundir"
+--     state <- runDBM (setup cfg)
+--     let wq = dbWriter state
+--     writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
+--     (refs,flushes) <- unzip <$> mapM wait writes
+--     flushWriteQueue wq
+--     mapM_ takeMVar flushes
+--     print $ length refs
 
 
 

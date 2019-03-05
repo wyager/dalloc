@@ -1,8 +1,8 @@
 module Main (main) where
 
-import Lib.System (demo)
+import Lib.System ()
 main :: IO ()
-main = demo
+main = return ()
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
