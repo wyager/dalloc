@@ -541,44 +541,43 @@ spawnReaders qLen shardShift cfg = do
     return (Readers shardShift queues, exception)
 
 
--- -- highestIx :: Set Ref -> 
 
--- segBound :: Segment -> (Ref,Ref)
--- segBound seg = (Ref seg minBound, Ref seg maxBound)
+segBound :: Segment -> (Ref,Ref)
+segBound seg = (Ref seg minBound, Ref seg maxBound)
 
--- setRange :: Ord a => a -> a -> Set a -> (Set a, Set a, Set a)
--- setRange lo hi set = (tooLow, good, tooHigh)
---     where
---     (tooLow, feasible) = spanAntitone (< lo) set
---     (good, tooHigh) = spanAntitone (<= hi) feasible
+setRange :: Ord a => a -> a -> Set a -> (Set a, Set a, Set a)
+setRange lo hi set = (tooLow, good, tooHigh)
+    where
+    (tooLow, feasible) = spanAntitone (< lo) set
+    (good, tooHigh) = spanAntitone (<= hi) feasible
 
 -- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
 -- wrt that segment) and passes it to the GC
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
 
--- spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
--- spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
---     where
---     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
---                                 | null currentIxes = undefined "Just save an empty segment"
---                                 | otherwise = do
---                                     let old_filepath = segmentPath filenameConfig snapshotSegment
---                                     old_mmapped <- mmap old_filepath
---                                     let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
---                                         new_filepath = partialSegmentPath filenameConfig snapshotSegment
---                                     new_hdl <- liftIO $ openFile new_filepath WriteMode 
---                                     (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
---                                     new_mmapped <- mmap new_filepath
---                                     liftIO $ registerGC snapshotSegment new_mmapped
---                                     let olderRefs' = union olderRefs activeRefs
---                                     score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
---                                     if score < 0.1 || snapshotSegment == minBound
---                                         then return ()
---                                         else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
+spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan IO GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
+spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
+    where
+    peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
+                                | null currentIxes = undefined "Just save an empty segment"
+                                | otherwise = do
+                                    let old_filepath = segmentPath filenameConfig snapshotSegment
+                                    old_mmapped <- mmap old_filepath
+                                    let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
+                                        new_filepath = partialSegmentPath filenameConfig snapshotSegment
+                                    new_hdl <- liftIO $ openFile new_filepath WriteMode 
+                                    (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
+                                    new_mmapped <- mmap new_filepath
+                                    liftIO $ registerGC snapshotSegment new_mmapped
+                                    let olderRefs' = union olderRefs activeRefs
+                                    score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
+                                    if score < 0.1 || snapshotSegment == minBound
+                                        then return ()
+                                        else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
 
---         where
---         (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
---         currentIxes = Set.map refIx currentRefs
+        where
+        (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
+        currentIxes = Set.map refIx currentRefs
 
 
 data ReadCache m = ReadCache {
@@ -855,18 +854,6 @@ consume' state@ConsumerState{..} = \case
 consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m r -> m (Of () r)
 consumeFile cfg = consume (saveFile cfg) (finalizeFile cfg)
 
-
--- class MonadVar var m where
---     putVar :: var a -> a -> m ()
---     -- newEmptyVar :: m (var a)
-
--- instance MonadIO m => MonadVar MVar m where
---     putVar var = liftIO . putMVar var
---     -- newEmptyVar = liftIO newEmptyMVar
-
--- instance MonadVar Proxy Identity where
---     putVar _ _ = return ()
---     -- newEmptyVar = return Proxy
 
 {-# INLINE saveFile #-}
 saveFile :: (MonadConc m, Writable m) => ConsumerConfig m -> ConsumerAction (MVar m Flushed) (MVar m Ref) -> m ()
