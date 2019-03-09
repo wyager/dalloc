@@ -291,27 +291,20 @@ data IrrecoverableFailure
     | IFOffsetDecodeEx OffsetDecodeEx
     | IFReaderConsistencyError ReaderConsistencyError
     | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
-    | IFInitFailure InitFailure
     | IFSegmentStreamError SegmentStreamError
     | IFGCError GCError
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
 
-newtype GCM a = GCM {runGCM :: IO a}
-    deriving newtype (Functor,Applicative,Monad,MonadIO)
 
-instance MultiError GCError               GCM where throw = liftIO . throwIO . IFGCError
-instance MultiError StoredOffsetsDecodeEx GCM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
-instance MultiError OffsetDecodeEx        GCM where throw = liftIO . throwIO . IFOffsetDecodeEx
-
+instance MultiError GCError               IO where throw = liftIO . throwIO . IFGCError
 
 instance MultiError IndexError             IO where throw = liftIO . throwIO . IFIndexError
 instance MultiError CacheConsistencyError  IO where throw = liftIO . throwIO . IFCacheConsistencyError
 instance MultiError OffsetDecodeEx         IO where throw = liftIO . throwIO . IFOffsetDecodeEx
 instance MultiError ReaderConsistencyError IO where throw = liftIO . throwIO . IFReaderConsistencyError
 instance MultiError StoredOffsetsDecodeEx  IO where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
-instance MultiError InitFailure            IO where throw = liftIO . throwIO . IFInitFailure
 instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . IFSegmentStreamError
 
 newtype MockDBMT m a = MockDBMT {runMockDBMT :: ExceptT IrrecoverableFailure m a}
@@ -322,7 +315,6 @@ instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw =
 instance Monad m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = MockDBMT . throwError . IFOffsetDecodeEx
 instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw = MockDBMT . throwError . IFReaderConsistencyError
 instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = MockDBMT . throwError . IFStoredOffsetsDecodeEx
-instance Monad m => MultiError InitFailure            (MockDBMT m) where throw = MockDBMT . throwError . IFInitFailure
 instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = MockDBMT . throwError . IFSegmentStreamError
 
 
@@ -471,37 +463,33 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: SegmentResource IO Handle -> FilenameConfig -> InitResult' (IO ByteString) -> IO Segment
-loadInitSeg SegmentResource{..} filenameConfig status = case status of
+loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> FilenameConfig -> InitResult' (m ByteString) -> m Segment
+loadInitSeg run SegmentResource{..} filenameConfig status = case status of
         NoData' -> return (Segment 0)
         CleanShutdown' highestSeg _loadHighestSeg -> return (succ highestSeg)
         AbruptShutdown' partialSeg  loadPartialSeg -> do
-            let partialPath = partialSegmentPath filenameConfig partialSeg
-                temporaryPath = partialPath ++ ".rebuild"
-                finalPath = segmentPath filenameConfig partialSeg
             partial <- loadPartialSeg
-            -- hdl <- liftIO $ openFile temporaryPath WriteMode 
             overwriteSeg partialSeg $ \hdl -> do
                 let entries = streamBS partial
                     fakeWrite bs = do
-                        ref <- liftIO newEmptyMVar
-                        flushed <- liftIO newEmptyMVar
+                        ref <- newEmptyMVar
+                        flushed <- newEmptyMVar
                         return $ Write ref flushed bs
                     fakeWriteQ = SP.mapM fakeWrite entries
+                    config :: ConsumerConfig n
                     config = ConsumerConfig partialSeg (const (return ()))
-                () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
+                () :> _savedOffs <- run hdl $ consumeFile @n config fakeWriteQ
                 return (succ partialSeg)
 
 setup :: DBConfig IO -> IO (DBState IO)
 setup DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
-    initSeg <- loadInitSeg segmentResource filenameConfig status
+    initSeg <- loadInitSeg (\hdl write -> runHandleT (runBufferT write) hdl) segmentResource filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
     (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
-data InitFailure = IDon'tUnderstandSearchM deriving Show
 
 data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment 
 
@@ -542,21 +530,6 @@ initialize' find = do
                         where
                         test = (lo + hi + 1) `div` 2
 
-initialize :: (MonadIO m, Throws '[InitFailure] m) => FilenameConfig -> m InitResult
-initialize FilenameConfig{..} = do
-    let searchRanges = ([0], take 64 $ iterate (*2) 1)
-        isThere = liftIO . doesFileExist
-        noSegFile ix = not <$> isThere (segmentPath (Segment ix))
-    searchM searchRanges divForever noSegFile >>= \case
-        [_trivial] -> isThere (partialSegmentPath (Segment 0)) >>= \case
-            True -> return $ AbruptShutdown (Segment 0)
-            False -> return $ NoData
-        [exists,_] -> do
-            let highestExists = hiVal exists
-            isThere (partialSegmentPath (Segment (highestExists + 1))) >>= \case
-                True -> return $ AbruptShutdown (Segment (highestExists + 1))
-                False -> return $ CleanShutdown (Segment highestExists)
-        _ -> throw IDon'tUnderstandSearchM
 
 
 
@@ -625,7 +598,7 @@ setRange lo hi set = (tooLow, good, tooHigh)
 -- wrt that segment) and passes it to the GC
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
 
-spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan IO GcSnapshot -> (Segment -> MMapped -> IO ()) -> GCM void
+spawnGcManager :: GcConfig ByteString -> FilenameConfig -> Chan IO GcSnapshot -> (Segment -> MMapped -> IO ()) -> IO void
 spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
     where
     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
@@ -633,7 +606,7 @@ spawnGcManager gcconf filenameConfig completeSegs registerGC = forever (liftIO (
                                 | otherwise = do
                                     let old_filepath = segmentPath filenameConfig snapshotSegment
                                     old_mmapped <- mmap old_filepath
-                                    let collect = gc @(BufferT (HandleT GCM)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
+                                    let collect = gc @(BufferT (HandleT IO)) gcconf snapshotSegment currentIxes RootKnown old_mmapped
                                         new_filepath = partialSegmentPath filenameConfig snapshotSegment
                                     new_hdl <- liftIO $ openFile new_filepath WriteMode 
                                     (_offs, activeRefs, _perst) <- runHandleT (runBufferT collect) new_hdl
