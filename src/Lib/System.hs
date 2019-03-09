@@ -391,9 +391,17 @@ data FilenameConfig = FilenameConfig {
         partialSegmentPath :: Segment -> FilePath
     }
 
+data CrashState = Interrupted | Finished
+
+data SegmentResource m resource = SegmentResource {
+    writeToSeg :: forall a . Segment -> (resource -> m a) -> m a,
+    loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
+}
+
 
 data DBConfig m = DBConfig {
         filenameConfig :: FilenameConfig,
+        segmentResource :: SegmentResource m Handle,
         maxWriteQueueLen :: Int,
         maxReadQueueLen :: Int,
         readQueueShardShift :: Int,
@@ -401,19 +409,30 @@ data DBConfig m = DBConfig {
         consumerLimits :: ConsumerLimits
     }
 
-defaultDBConfig :: (Segment -> m ByteString) -> FilePath -> DBConfig m
-defaultDBConfig openSeg rundir = DBConfig{..}
+defaultDBConfig :: FilePath -> DBConfig IO
+defaultDBConfig rundir = DBConfig{..}
     where
     segPath seg = rundir ++ "/" ++ show seg
     filenameConfig = FilenameConfig {
             segmentPath = segPath,
             partialSegmentPath = (\seg -> segPath seg ++ "~")
         }
+    writeToSeg segment f = undefined
+    loadSeg cs segment = do
+        exists <- doesFileExist path
+        return $ if exists
+            then Just $ mmapFileByteString path Nothing
+            else Nothing
+        where
+        path = rundir ++ "/" ++ show segment ++ (case cs of Finished -> ""; Interrupted -> "~") 
+    segmentResource = SegmentResource {..}
     maxWriteQueueLen = 16
     maxReadQueueLen = 16
     readQueueShardShift = 0
     readerConfig = ReaderConfig {
-            openSeg = openSeg, -- (\seg -> mmapFileByteString (segPath seg) Nothing),
+            openSeg = (\seg -> (loadSeg Finished seg >>= \case
+                Nothing -> error "Segment doesn't exist. TODO: Remove this"
+                Just load -> load)),
             lruSize = 16,
             maxOpenSegs = 16
         }
