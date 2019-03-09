@@ -17,7 +17,7 @@ import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Builder (Builder, byteString, hPutBuilder)
 import           Data.Foldable (toList)
-import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile)
+import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile, withFile)
 import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
@@ -394,7 +394,7 @@ data FilenameConfig = FilenameConfig {
 data CrashState = Interrupted | Finished
 
 data SegmentResource m resource = SegmentResource {
-    writeToSeg :: forall a . Segment -> (resource -> m a) -> m a,
+    writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 }
 
@@ -412,19 +412,21 @@ data DBConfig m = DBConfig {
 defaultDBConfig :: FilePath -> DBConfig IO
 defaultDBConfig rundir = DBConfig{..}
     where
-    segPath seg = rundir ++ "/" ++ show seg
+    segPath cs seg = rundir ++ "/" ++ show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
     filenameConfig = FilenameConfig {
-            segmentPath = segPath,
-            partialSegmentPath = (\seg -> segPath seg ++ "~")
+            segmentPath = segPath Finished,
+            partialSegmentPath = (segPath Interrupted)
         }
-    writeToSeg segment f = undefined
+    writeToSeg :: forall a . Segment -> (Handle -> IO a) -> IO a
+    writeToSeg segment f = do
+        res <- withFile (segPath Interrupted segment) WriteMode f
+        renameFile (segPath Interrupted segment) (segPath Finished segment)
+        return res
     loadSeg cs segment = do
-        exists <- doesFileExist path
+        exists <- doesFileExist (segPath cs segment)
         return $ if exists
-            then Just $ mmapFileByteString path Nothing
+            then Just $ mmapFileByteString (segPath cs segment) Nothing
             else Nothing
-        where
-        path = rundir ++ "/" ++ show segment ++ (case cs of Finished -> ""; Interrupted -> "~") 
     segmentResource = SegmentResource {..}
     maxWriteQueueLen = 16
     maxReadQueueLen = 16
@@ -488,6 +490,28 @@ setup DBConfig{..} = do
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
 data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment 
+
+
+-- data SegmentResource m resource = SegmentResource {
+--     writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
+--     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
+-- }
+
+data InitResult' = NoData' | CleanShutdown' Segment ByteString | AbruptShutdown' Segment ByteString 
+
+
+initialize' :: Throws '[InitFailure] m => (CrashState -> Segment -> m (Maybe (m ByteString)))-> m InitResult'
+initialize' find = undefined
+    where
+    exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> m (Maybe (key, val))
+    exponentialBounds find = maybe (return Nothing) (go 1) Nothing
+        wher go n highest = do
+                val <- find n
+                maybe (return $ Just highest) (go (n*2)) ((n,) <$> val)        
+    -- Invariant: lo - 1 is known to return Some
+    binarySearch :: (Num key, Monad m) => (key -> m (Maybe val)) -> key -> key -> m (Maybe val)
+    binarySearch f lo hi | lo == hi = f lo
+                         | otherwise = 
 
 initialize :: (MonadIO m, Throws '[InitFailure] m) => FilenameConfig -> m InitResult
 initialize FilenameConfig{..} = do
