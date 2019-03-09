@@ -455,11 +455,11 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: FilenameConfig -> InitResult' -> IO Segment
+loadInitSeg :: FilenameConfig -> InitResult' k -> IO Segment
 loadInitSeg filenameConfig status = case status of
         NoData' -> return (Segment 0)
-        CleanShutdown' highestSeg _highestSegContents -> return (succ highestSeg)
-        AbruptShutdown' partialSeg  _partialSegContents -> do
+        CleanShutdown' highestSeg _loadHighestSeg -> return (succ highestSeg)
+        AbruptShutdown' partialSeg  _loadPartialSeg -> do
             let partialPath = partialSegmentPath filenameConfig partialSeg
                 temporaryPath = partialPath ++ ".rebuild"
                 finalPath = segmentPath filenameConfig partialSeg
@@ -497,21 +497,21 @@ data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment
 --     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 -- }
 
-data InitResult'  = NoData' | CleanShutdown' Segment ByteString | AbruptShutdown' Segment ByteString 
+data InitResult' k  = NoData' | CleanShutdown' Segment k | AbruptShutdown' Segment k 
 
 
-initialize' :: Throws '[InitFailure] m => (CrashState -> Segment -> m (Maybe (m ByteString)))-> m InitResult'
+initialize' :: Monad m => (CrashState -> Segment -> m (Maybe k)) -> m (InitResult' k)
 initialize' find = do
     find Finished 0 >>= \case
         Nothing -> find Interrupted 0 >>= \case
             Nothing -> return NoData'
-            Just load -> AbruptShutdown' 0 <$> load
-        Just load -> do
-            (expMin,expLoad) <- exponentialBounds (find Finished) (0,load)
+            Just k -> return $ AbruptShutdown' 0  k
+        Just k -> do
+            (expMin,expLoad) <- exponentialBounds (find Finished) (0,k)
             (binExact,binLoad) <- binarySearch (find Finished) (expMin,expLoad) (expMin * 2)
             find Interrupted (binExact + 1) >>= \case
-                Nothing -> CleanShutdown' binExact <$> binLoad
-                Just load -> AbruptShutdown' (binExact + 1) <$> load
+                Nothing -> return $ CleanShutdown' binExact binLoad
+                Just k' -> return $ AbruptShutdown' (binExact + 1) k'
     where
     exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> m (key, val)
     exponentialBounds find zero = go 1 zero
