@@ -609,26 +609,25 @@ data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set R
 --     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 -- }
 
+-- loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> FilenameConfig -> InitResult' (m ByteString) -> m Segment
 
 
-spawnGcManager :: GcConfig ByteString -> FilenameConfig -> SegmentResource IO Handle -> Chan IO GcSnapshot -> (Segment -> MMapped -> IO ()) -> IO void
-spawnGcManager gcconf filenameConfig SegmentResource{..} completeSegs registerGC = forever (liftIO (readChan completeSegs) >>= peristaltize)
+spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, Writable n, Throws '[OffsetDecodeEx, GCError] n) => (forall a . hdl -> n a -> m a) -> GcConfig ByteString -> FilenameConfig -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) -> m void
+spawnGcManager run gcconf filenameConfig SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
     where
     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
                                 | null currentIxes = undefined "Just save an empty segment"
                                 | otherwise = do
-                                    -- let old_filepath = segmentPath filenameConfig snapshotSegment
-                                    -- old_mmapped <- mmap old_filepath
                                     let load = loadSeg Finished snapshotSegment >>= maybe (throw (GCSegmentLoadError snapshotSegment)) id 
                                     old_bs <- load
                                     old_offs <- either throw return $ loadOffsets old_bs
                                     let old = MMapped old_offs old_bs
-                                        collect = gc @(BufferT (HandleT IO)) gcconf snapshotSegment currentIxes RootKnown old
-                                    (new_offs, activeRefs, _pers) <- overwriteSeg snapshotSegment $ runHandleT (runBufferT collect)
+                                        collect = gc gcconf snapshotSegment currentIxes RootKnown old
+                                    (new_offs, activeRefs, _pers) <- overwriteSeg snapshotSegment $ (\hdl -> run hdl collect)
                                     new_bs <- load
                                     registerGC snapshotSegment (MMapped new_offs new_bs)
                                     let olderRefs' = union olderRefs activeRefs
-                                    score <- liftIO $ getRandomR (0.0, 1.0 :: Double)
+                                    score <- getRandomR (0.0, 1.0 :: Double)
                                     if score < 0.1 || snapshotSegment == minBound
                                         then return ()
                                         else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
