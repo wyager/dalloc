@@ -305,16 +305,14 @@ instance MultiError GCError               GCM where throw = liftIO . throwIO . I
 instance MultiError StoredOffsetsDecodeEx GCM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
 instance MultiError OffsetDecodeEx        GCM where throw = liftIO . throwIO . IFOffsetDecodeEx
 
-newtype DBM a = DBM {runDBM :: IO a}
-    deriving newtype (Functor,Applicative,Monad,MonadIO)
 
-instance MultiError IndexError             DBM where throw = liftIO . throwIO . IFIndexError
-instance MultiError CacheConsistencyError  DBM where throw = liftIO . throwIO . IFCacheConsistencyError
-instance MultiError OffsetDecodeEx         DBM where throw = liftIO . throwIO . IFOffsetDecodeEx
-instance MultiError ReaderConsistencyError DBM where throw = liftIO . throwIO . IFReaderConsistencyError
-instance MultiError StoredOffsetsDecodeEx  DBM where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
-instance MultiError InitFailure            DBM where throw = liftIO . throwIO . IFInitFailure
-instance MultiError SegmentStreamError     DBM where throw = liftIO . throwIO . IFSegmentStreamError
+instance MultiError IndexError             IO where throw = liftIO . throwIO . IFIndexError
+instance MultiError CacheConsistencyError  IO where throw = liftIO . throwIO . IFCacheConsistencyError
+instance MultiError OffsetDecodeEx         IO where throw = liftIO . throwIO . IFOffsetDecodeEx
+instance MultiError ReaderConsistencyError IO where throw = liftIO . throwIO . IFReaderConsistencyError
+instance MultiError StoredOffsetsDecodeEx  IO where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
+instance MultiError InitFailure            IO where throw = liftIO . throwIO . IFInitFailure
+instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . IFSegmentStreamError
 
 newtype MockDBMT m a = MockDBMT {runMockDBMT :: ExceptT IrrecoverableFailure m a}
     deriving newtype (Functor, Applicative, Monad)
@@ -436,28 +434,28 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
--- loadInitSeg :: FilenameConfig -> InitResult -> DBM Segment
--- loadInitSeg filenameConfig status = case status of
---         NoData -> return (Segment 0)
---         CleanShutdown highestSeg -> return (succ highestSeg)
---         AbruptShutdown partialSeg -> do
---             let partialPath = partialSegmentPath filenameConfig partialSeg
---                 temporaryPath = partialPath ++ ".rebuild"
---                 finalPath = segmentPath filenameConfig partialSeg
---             partial <- liftIO $ mmapFileByteString partialPath Nothing
---             hdl <- liftIO $ openFile temporaryPath WriteMode 
---             let entries = streamBS partial
---                 fakeWrite bs = do
---                     ref <- liftIO newEmptyMVar
---                     flushed <- liftIO newEmptyMVar
---                     return $ Write ref flushed bs
---                 fakeWriteQ = SP.mapM fakeWrite entries
---                 config = ConsumerConfig partialSeg (const (return ()))
---             () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
---             liftIO $ do
---                 renameFile temporaryPath finalPath
---                 removeFile partialPath
---             return (succ partialSeg)
+loadInitSeg :: FilenameConfig -> InitResult -> IO Segment
+loadInitSeg filenameConfig status = case status of
+        NoData -> return (Segment 0)
+        CleanShutdown highestSeg -> return (succ highestSeg)
+        AbruptShutdown partialSeg -> do
+            let partialPath = partialSegmentPath filenameConfig partialSeg
+                temporaryPath = partialPath ++ ".rebuild"
+                finalPath = segmentPath filenameConfig partialSeg
+            partial <- liftIO $ mmapFileByteString partialPath Nothing
+            hdl <- liftIO $ openFile temporaryPath WriteMode 
+            let entries = streamBS partial
+                fakeWrite bs = do
+                    ref <- liftIO newEmptyMVar
+                    flushed <- liftIO newEmptyMVar
+                    return $ Write ref flushed bs
+                fakeWriteQ = SP.mapM fakeWrite entries
+                config = ConsumerConfig partialSeg (const (return ()))
+            () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
+            liftIO $ do
+                renameFile temporaryPath finalPath
+                removeFile partialPath
+            return (succ partialSeg)
 
 -- setup :: DBConfig -> DBM DBState
 -- setup DBConfig{..} = do
@@ -527,7 +525,7 @@ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
     return (writeQ, exn)
 
 spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) 
-             => Int -> Int -> ReaderConfig m -> m (Readers m, Async m exception)
+             => Int -> Int -> ReaderConfig m -> m (Readers m, Async m void)
 spawnReaders qLen shardShift cfg = do
     let spawn = do
             readQ <- readQueue qLen
