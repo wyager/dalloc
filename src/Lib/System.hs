@@ -54,7 +54,7 @@ import           Control.Concurrent.Classy (MonadConc)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
 
 newtype Segment = Segment Word64
-    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded)
+    deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded, Num, Real, Integral)
 
 newtype Ix = Ix Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded)
@@ -455,11 +455,11 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: FilenameConfig -> InitResult -> IO Segment
+loadInitSeg :: FilenameConfig -> InitResult' -> IO Segment
 loadInitSeg filenameConfig status = case status of
-        NoData -> return (Segment 0)
-        CleanShutdown highestSeg -> return (succ highestSeg)
-        AbruptShutdown partialSeg -> do
+        NoData' -> return (Segment 0)
+        CleanShutdown' highestSeg _highestSegContents -> return (succ highestSeg)
+        AbruptShutdown' partialSeg  _partialSegContents -> do
             let partialPath = partialSegmentPath filenameConfig partialSeg
                 temporaryPath = partialPath ++ ".rebuild"
                 finalPath = segmentPath filenameConfig partialSeg
@@ -480,7 +480,7 @@ loadInitSeg filenameConfig status = case status of
 
 setup :: DBConfig IO -> IO (DBState IO)
 setup DBConfig{..} = do
-    status <- initialize filenameConfig
+    status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
@@ -497,21 +497,36 @@ data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment
 --     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 -- }
 
-data InitResult' = NoData' | CleanShutdown' Segment ByteString | AbruptShutdown' Segment ByteString 
+data InitResult'  = NoData' | CleanShutdown' Segment ByteString | AbruptShutdown' Segment ByteString 
 
 
 initialize' :: Throws '[InitFailure] m => (CrashState -> Segment -> m (Maybe (m ByteString)))-> m InitResult'
-initialize' find = undefined
+initialize' find = do
+    find Finished 0 >>= \case
+        Nothing -> find Interrupted 0 >>= \case
+            Nothing -> return NoData'
+            Just load -> AbruptShutdown' 0 <$> load
+        Just load -> do
+            (expMin,expLoad) <- exponentialBounds (find Finished) (0,load)
+            (binExact,binLoad) <- binarySearch (find Finished) (expMin,expLoad) (expMin * 2)
+            find Interrupted (binExact + 1) >>= \case
+                Nothing -> CleanShutdown' binExact <$> binLoad
+                Just load -> AbruptShutdown' (binExact + 1) <$> load
     where
-    exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> m (Maybe (key, val))
-    exponentialBounds find = maybe (return Nothing) (go 1) Nothing
-        wher go n highest = do
-                val <- find n
-                maybe (return $ Just highest) (go (n*2)) ((n,) <$> val)        
-    -- Invariant: lo - 1 is known to return Some
-    binarySearch :: (Num key, Monad m) => (key -> m (Maybe val)) -> key -> key -> m (Maybe val)
-    binarySearch f lo hi | lo == hi = f lo
-                         | otherwise = 
+    exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> m (key, val)
+    exponentialBounds find zero = go 1 zero
+        where 
+        go n highest = do
+            val <- find n
+            maybe (return highest) (go (n*2)) ((n,) <$> val)        
+    -- invariant: There are no keys higher than `hi` which might return `Just _`
+    binarySearch :: (Integral key, Eq key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> key -> m (key,val)
+    binarySearch f (lo,lv) hi = go lo lv hi 
+        where
+        go lo lv hi | lo == hi = return (lo,lv)
+                    | otherwise = f test >>= maybe (go lo lv test) (\tv -> go test tv hi)
+                        where
+                        test = (lo + hi + 1) `div` 2
 
 initialize :: (MonadIO m, Throws '[InitFailure] m) => FilenameConfig -> m InitResult
 initialize FilenameConfig{..} = do
