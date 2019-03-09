@@ -394,6 +394,11 @@ data FilenameConfig = FilenameConfig {
 data CrashState = Interrupted | Finished
 
 data SegmentResource m resource = SegmentResource {
+    -- Does not save intermediate progress. If the program crashes, 
+    -- the overwrite will be lost. Upon completion of overwrite, replaces 
+    -- the Finished file and deletes any interrupted file (if present)
+    overwriteSeg :: (forall a . Segment -> (resource -> m a) -> m a),
+    -- If interrupted, leaves the results in a predictable place
     writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 }
@@ -417,6 +422,17 @@ defaultDBConfig rundir = DBConfig{..}
             segmentPath = segPath Finished,
             partialSegmentPath = (segPath Interrupted)
         }
+    overwriteSeg :: forall a . Segment -> (Handle -> IO a) -> IO a
+    overwriteSeg segment f = do
+        -- Could also do some sort of unlinking thing so the file gets deleted automatically
+        let int = segPath Interrupted segment
+            tmp = int ++ ".deleteme" 
+        res <- withFile tmp WriteMode f
+        renameFile tmp (segPath Finished segment)
+        doesFileExist int >>= \case
+            False -> return ()
+            True -> removeFile int
+        return res
     writeToSeg :: forall a . Segment -> (Handle -> IO a) -> IO a
     writeToSeg segment f = do
         res <- withFile (segPath Interrupted segment) WriteMode f
@@ -455,33 +471,31 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: FilenameConfig -> InitResult' k -> IO Segment
-loadInitSeg filenameConfig status = case status of
+loadInitSeg :: SegmentResource IO Handle -> FilenameConfig -> InitResult' (IO ByteString) -> IO Segment
+loadInitSeg SegmentResource{..} filenameConfig status = case status of
         NoData' -> return (Segment 0)
         CleanShutdown' highestSeg _loadHighestSeg -> return (succ highestSeg)
-        AbruptShutdown' partialSeg  _loadPartialSeg -> do
+        AbruptShutdown' partialSeg  loadPartialSeg -> do
             let partialPath = partialSegmentPath filenameConfig partialSeg
                 temporaryPath = partialPath ++ ".rebuild"
                 finalPath = segmentPath filenameConfig partialSeg
-            partial <- liftIO $ mmapFileByteString partialPath Nothing
-            hdl <- liftIO $ openFile temporaryPath WriteMode 
-            let entries = streamBS partial
-                fakeWrite bs = do
-                    ref <- liftIO newEmptyMVar
-                    flushed <- liftIO newEmptyMVar
-                    return $ Write ref flushed bs
-                fakeWriteQ = SP.mapM fakeWrite entries
-                config = ConsumerConfig partialSeg (const (return ()))
-            () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
-            liftIO $ do
-                renameFile temporaryPath finalPath
-                removeFile partialPath
-            return (succ partialSeg)
+            partial <- loadPartialSeg
+            -- hdl <- liftIO $ openFile temporaryPath WriteMode 
+            overwriteSeg partialSeg $ \hdl -> do
+                let entries = streamBS partial
+                    fakeWrite bs = do
+                        ref <- liftIO newEmptyMVar
+                        flushed <- liftIO newEmptyMVar
+                        return $ Write ref flushed bs
+                    fakeWriteQ = SP.mapM fakeWrite entries
+                    config = ConsumerConfig partialSeg (const (return ()))
+                () :> _savedOffs <- runHandleT (runBufferT $ consumeFile config (hoist lift fakeWriteQ)) hdl
+                return (succ partialSeg)
 
 setup :: DBConfig IO -> IO (DBState IO)
 setup DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
-    initSeg <- loadInitSeg filenameConfig status
+    initSeg <- loadInitSeg segmentResource filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
     (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
