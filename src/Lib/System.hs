@@ -457,14 +457,14 @@ loadInitSeg filenameConfig status = case status of
                 removeFile partialPath
             return (succ partialSeg)
 
--- setup :: DBConfig -> DBM DBState
--- setup DBConfig{..} = do
---     status <- initialize filenameConfig
---     initSeg <- loadInitSeg filenameConfig status
---     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
---     hotCache <- liftIO $ newMVar (initSeg, mempty)
---     (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
---     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
+setup :: DBConfig IO -> IO (DBState IO)
+setup DBConfig{..} = do
+    status <- initialize filenameConfig
+    initSeg <- loadInitSeg filenameConfig status
+    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
+    hotCache <- liftIO $ newMVar (initSeg, mempty)
+    (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
+    return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 data InitFailure = IDon'tUnderstandSearchM deriving Show
 
