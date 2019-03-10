@@ -365,11 +365,6 @@ readerStep state@ReaderState{..} = \case
         return (state {segmentCache = cache'}, Nothing)
     ReadExn exn -> throw exn
 
-data FilenameConfig = FilenameConfig {
-        segmentPath :: Segment -> FilePath,
-        partialSegmentPath :: Segment -> FilePath
-    }
-
 data CrashState = Interrupted | Finished
 
 data SegmentResource m resource = SegmentResource {
@@ -384,7 +379,6 @@ data SegmentResource m resource = SegmentResource {
 
 
 data DBConfig m = DBConfig {
-        filenameConfig :: FilenameConfig,
         segmentResource :: SegmentResource m Handle,
         maxWriteQueueLen :: Int,
         maxReadQueueLen :: Int,
@@ -397,10 +391,10 @@ defaultDBConfig :: FilePath -> DBConfig IO
 defaultDBConfig rundir = DBConfig{..}
     where
     segPath cs seg = rundir ++ "/" ++ show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
-    filenameConfig = FilenameConfig {
-            segmentPath = segPath Finished,
-            partialSegmentPath = (segPath Interrupted)
-        }
+    -- filenameConfig = FilenameConfig {
+    --         segmentPath = segPath Finished,
+    --         partialSegmentPath = (segPath Interrupted)
+    --     }
     overwriteSeg :: forall a . Segment -> (Handle -> IO a) -> IO a
     overwriteSeg segment f = do
         -- Could also do some sort of unlinking thing so the file gets deleted automatically
@@ -450,8 +444,8 @@ dbFinish :: MonadConc m => DBState m -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
-loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> FilenameConfig -> InitResult' (m ByteString) -> m Segment
-loadInitSeg run SegmentResource{..} filenameConfig status = case status of
+loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> InitResult' (m ByteString) -> m Segment
+loadInitSeg run SegmentResource{..} status = case status of
         NoData' -> return (Segment 0)
         CleanShutdown' highestSeg _loadHighestSeg -> return (succ highestSeg)
         AbruptShutdown' partialSeg  loadPartialSeg -> do
@@ -472,10 +466,10 @@ setup :: DBConfig IO -> IO (DBState IO)
 setup DBConfig{..} = do
     let run hdl write = runHandleT (runBufferT write) hdl
     status <- initialize' (loadSeg segmentResource)
-    initSeg <- loadInitSeg run segmentResource filenameConfig status
+    initSeg <- loadInitSeg run segmentResource status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
-    (writer, writerExn) <- liftIO $ spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource filenameConfig consumerLimits
+    (writer, writerExn) <- liftIO $ spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 
@@ -546,8 +540,8 @@ readViaReaders ref Readers{..} = do
 -- }
 
 
-spawnWriter :: forall m n hdl . (MonadConc m, MVar m ~ MVar n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> (forall a . m a -> n a) -> MVar m (Segment, Map Offset ByteString) -> Int -> Segment -> SegmentResource m hdl -> FilenameConfig -> ConsumerLimits -> m (WriteQueue m, Async m Void )
-spawnWriter run liftN hotCache maxWriteQueueLen initSeg SegmentResource{..} filenameConfig consumerLimits = do
+spawnWriter :: forall m n hdl . (MonadConc m, MVar m ~ MVar n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> (forall a . m a -> n a) -> MVar m (Segment, Map Offset ByteString) -> Int -> Segment -> SegmentResource m hdl -> ConsumerLimits -> m (WriteQueue m, Async m Void )
+spawnWriter run liftN hotCache maxWriteQueueLen initSeg SegmentResource{..} consumerLimits = do
     writeQ <- newWriteQueue maxWriteQueueLen
     let chunks = hoist lift $ splitWith @m consumerLimits (streamWriteQ writeQ)
         writeSeg :: Segment -> Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m x -> m x
@@ -605,15 +599,14 @@ data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set R
 --     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
 -- }
 
--- loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> FilenameConfig -> InitResult' (m ByteString) -> m Segment
 
 
 spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
                    Writable n, Throws '[OffsetDecodeEx, GCError] n)
-               => (forall a . hdl -> n a -> m a) -> GcConfig ByteString -> FilenameConfig 
+               => (forall a . hdl -> n a -> m a) -> GcConfig ByteString 
                -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) 
                -> m void
-spawnGcManager run gcconf filenameConfig SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
+spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
     where
     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
                                 | null currentIxes = undefined "Just save an empty segment"
