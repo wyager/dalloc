@@ -123,8 +123,8 @@ streamWriteQ (WriteQueue q) = go
     where
     go = lift (readChan q) >>= yield >> go
 
-newWriteQueueIO :: MonadConc m => Int -> m (WriteQueue m)
-newWriteQueueIO _maxLen = WriteQueue <$> newChan
+newWriteQueue :: MonadConc m => Int -> m (WriteQueue m)
+newWriteQueue _maxLen = WriteQueue <$> newChan
 
 data REnqueued m = Read !Ref !(MVar m ByteString)
                 | ReadComplete !Segment !MMapped
@@ -155,12 +155,6 @@ flushWriteQueue :: MonadConc m => WriteQueue m -> m ()
 flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
 
-mmap :: (MonadIO m, Throws '[StoredOffsetsDecodeEx] m) => FilePath -> m MMapped
-mmap path = do
-    bs <- liftIO $ mmapFileByteString path Nothing
-    offs <- either throw return $ loadOffsets bs
-    return (MMapped offs bs)
-
 
 -- -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
@@ -179,16 +173,9 @@ data SegmentCache = SegmentCache {
 emptySegmentCache :: Int -> SegmentCache 
 emptySegmentCache maxSize = SegmentCache {openSegments = Lru.empty maxSize, openSegmentDetails = Map.empty}
 
-
-
-type family (a::k) ∈ (b::[k]) :: Constraint where
-    a ∈ (a ': xs) = ()
-    a ∈ (b ': xs) = a ∈ xs
-
 type family Throws (ts::[k]) (m :: * -> *) :: Constraint where
     Throws '[] _ = ()
     Throws (t ': ts) m = (MultiError t m, Throws ts m)
-
 
 data StoredOffsetsDecodeEx = CacheLengthDecodeEx PeekException | CacheDecodeEx PeekException | SegmentTooShortForCache deriving Show
 
@@ -483,11 +470,12 @@ loadInitSeg run SegmentResource{..} filenameConfig status = case status of
 
 setup :: DBConfig IO -> IO (DBState IO)
 setup DBConfig{..} = do
+    let run hdl write = runHandleT (runBufferT write) hdl
     status <- initialize' (loadSeg segmentResource)
-    initSeg <- loadInitSeg (\hdl write -> runHandleT (runBufferT write) hdl) segmentResource filenameConfig status
+    initSeg <- loadInitSeg run segmentResource filenameConfig status
     (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
-    (writer, writerExn) <- liftIO $ spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits
+    (writer, writerExn) <- liftIO $ spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource filenameConfig consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 
@@ -547,25 +535,33 @@ readViaReaders ref Readers{..} = do
     writeChan rq $ Read ref readVar
     return readVar
 
+-- data SegmentResource m resource = SegmentResource {
+--     -- Does not save intermediate progress. If the program crashes, 
+--     -- the overwrite will be lost. Upon completion of overwrite, replaces 
+--     -- the Finished file and deletes any interrupted file (if present)
+--     overwriteSeg :: (forall a . Segment -> (resource -> m a) -> m a),
+--     -- If interrupted, leaves the results in a predictable place
+--     writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
+--     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
+-- }
 
-spawnWriter :: MVar IO (Segment, Map Offset ByteString) -> Int -> Segment -> FilenameConfig -> ConsumerLimits -> IO (WriteQueue IO, Async IO Void )
-spawnWriter hotCache maxWriteQueueLen initSeg filenameConfig consumerLimits = do
-    writeQ <- liftIO $ newWriteQueueIO maxWriteQueueLen
-    let chunks = hoist lift $ splitWith @IO consumerLimits (streamWriteQ writeQ)
-        writeSeg :: Segment -> Stream (Of (WEnqueued (MVar IO Flushed) (MVar IO Ref))) IO x -> IO x
+
+spawnWriter :: forall m n hdl . (MonadConc m, MVar m ~ MVar n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> (forall a . m a -> n a) -> MVar m (Segment, Map Offset ByteString) -> Int -> Segment -> SegmentResource m hdl -> FilenameConfig -> ConsumerLimits -> m (WriteQueue m, Async m Void )
+spawnWriter run liftN hotCache maxWriteQueueLen initSeg SegmentResource{..} filenameConfig consumerLimits = do
+    writeQ <- newWriteQueue maxWriteQueueLen
+    let chunks = hoist lift $ splitWith @m consumerLimits (streamWriteQ writeQ)
+        writeSeg :: Segment -> Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m x -> m x
         writeSeg seg writes = do
-            let filepath = partialSegmentPath filenameConfig seg
-                registerHotcache :: Map Offset ByteString -> IO ()
-                registerHotcache offsets = swapMVar @IO hotCache (seg, offsets) >> return ()
-                consumeToHdl = consumeFile @(BufferT (HandleT IO)) (ConsumerConfig seg (lift . lift . registerHotcache)) (hoist (lift . lift) writes)
-            hdl <- openFile filepath WriteMode
-            renameFile filepath (segmentPath filenameConfig seg)
-            () :> r <- runHandleT (runBufferT consumeToHdl) hdl
+            let registerHotcache :: Map Offset ByteString -> m ()
+                registerHotcache offsets = swapMVar @m hotCache (seg, offsets) >> return ()
+                consumeToHdl = consumeFile @n (ConsumerConfig seg (liftN . registerHotcache)) (hoist liftN writes)
+            () :> r <- writeToSeg seg (\hdl -> run hdl consumeToHdl)
             return r
+        writeSegS :: Stream (Of (WEnqueued (MVar m Flushed) (MVar m Ref))) m x -> StateT Segment m x
         writeSegS writes = do
             seg <- get
             put (succ seg)
-            liftIO $ writeSeg seg writes
+            lift $ writeSeg seg writes
     exn <- async $ flip evalStateT initSeg $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
@@ -612,7 +608,11 @@ data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set R
 -- loadInitSeg :: forall m n hdl . (Monad m, Throws '[SegmentStreamError] n, MonadConc n, Writable n) => (forall a . hdl -> n a -> m a) -> SegmentResource m hdl -> FilenameConfig -> InitResult' (m ByteString) -> m Segment
 
 
-spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, Writable n, Throws '[OffsetDecodeEx, GCError] n) => (forall a . hdl -> n a -> m a) -> GcConfig ByteString -> FilenameConfig -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) -> m void
+spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
+                   Writable n, Throws '[OffsetDecodeEx, GCError] n)
+               => (forall a . hdl -> n a -> m a) -> GcConfig ByteString -> FilenameConfig 
+               -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) 
+               -> m void
 spawnGcManager run gcconf filenameConfig SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
     where
     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
