@@ -9,13 +9,14 @@ import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, p
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO, SomeException, catch)
 import           Control.Concurrent.Classy.Chan (Chan, newChan, readChan, writeChan)
-import           Data.Map.Strict as Map (Map, insert, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
+import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty, union, spanAntitone)
 import qualified Data.Set as Set (map)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
-import           Data.ByteString.Builder (Builder, byteString, hPutBuilder)
+import           Data.ByteString.Lazy (toStrict)
+import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString)
 import           Data.Foldable (toList)
 import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile, withFile)
 import           System.IO.MMap (mmapFileByteString)
@@ -44,7 +45,7 @@ import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
 import           Control.Monad.Reader (ReaderT(..), ask)
-import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT)
+import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT, state, MonadState)
 import           Control.Monad.Identity (Identity(..))
 import           Control.Monad.Random.Class (MonadRandom, getRandomR)
 import           Control.Monad (replicateM, forever)
@@ -158,7 +159,7 @@ flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
 -- -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
-data ReaderConfig m = ReaderConfig {
+data ReaderConfig = ReaderConfig {
         lruSize     :: Int,
         maxOpenSegs :: Int
     }
@@ -295,8 +296,7 @@ instance MultiError StoredOffsetsDecodeEx  IO where throw = liftIO . throwIO . I
 instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . IFSegmentStreamError
 instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . IFSegmentNotFoundEx
 
-newtype MockDBMT m a = MockDBMT {runMockDBMT :: ExceptT IrrecoverableFailure m a}
-    deriving newtype (Functor, Applicative, Monad)
+
 
 instance Monad m => MultiError IndexError             (MockDBMT m) where throw = MockDBMT . throwError . IFIndexError
 instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = MockDBMT . throwError . IFCacheConsistencyError
@@ -309,7 +309,7 @@ instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw =
 
 data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
 
-reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) => (Segment -> m (Maybe (m ByteString))) -> ReaderConfig m -> ReadQueue m -> m void
+reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) => (Segment -> m (Maybe (m ByteString))) -> ReaderConfig -> ReadQueue m -> m void
 reader openSeg ReaderConfig{..} (ReadQueue q) = go initial
     where
     initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
@@ -382,16 +382,16 @@ data SegmentResource m resource = SegmentResource {
 }
 
 
-data DBConfig m = DBConfig {
-        segmentResource :: SegmentResource m Handle,
+data DBConfig m hdl = DBConfig {
+        segmentResource :: SegmentResource m hdl,
         maxWriteQueueLen :: Int,
         maxReadQueueLen :: Int,
         readQueueShardShift :: Int,
-        readerConfig :: ReaderConfig m,
+        readerConfig :: ReaderConfig,
         consumerLimits :: ConsumerLimits
     }
 
-defaultDBConfig :: FilePath -> DBConfig IO
+defaultDBConfig :: FilePath -> DBConfig IO Handle
 defaultDBConfig rundir = DBConfig{..}
     where
     segPath cs seg = rundir ++ "/" ++ show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
@@ -434,6 +434,63 @@ defaultDBConfig rundir = DBConfig{..}
         }
 
 
+newtype MockDBMT m a = MockDBMT {runMockDBMT :: StateT (Map FilePath Builder) (ExceptT IrrecoverableFailure m) a}
+    deriving newtype (Functor, Applicative, Monad, MonadState (Map FilePath Builder))
+
+newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
+
+writeToFakeHandle :: Monad m => FakeHandle -> Builder -> MockDBMT m ()
+writeToFakeHandle (FakeHandle path) builder = modify (Map.insertWith (flip (<>)) path builder)
+
+deleteFakeFile :: Monad m => FilePath -> MockDBMT m ()
+deleteFakeFile hdl = modify (Map.delete hdl)
+
+renameFakeFile :: Monad m => FilePath -> FilePath -> MockDBMT m ()
+renameFakeFile oldName newName = do
+    old <- state $ alterF (\old -> (old, Nothing)) oldName
+    -- NB: Should we complain if it doesn't exist?
+    modify $ alter (const old) newName
+
+doesFakeFileExist :: Monad m => FilePath -> MockDBMT m Bool
+doesFakeFileExist path = Map.member path <$> get
+
+
+mockDBConfig :: forall m . Monad m => DBConfig (MockDBMT m) FakeHandle
+mockDBConfig  = undefined -- DBConfig{..}
+    where
+    segPath cs seg = show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
+
+    overwriteSeg :: forall a . Segment -> (FakeHandle -> MockDBMT m a) -> MockDBMT m a
+    overwriteSeg segment f = do
+        -- Could also do some sort of unlinking thing so the file gets deleted automatically
+        let int = segPath Interrupted segment
+            tmp = int ++ ".deleteme" 
+        res <- f (FakeHandle tmp)
+        renameFakeFile tmp (segPath Finished segment)
+        doesFakeFileExist int >>= \case
+            False -> return ()
+            True -> deleteFakeFile int
+        return res
+    writeToSeg :: forall a . Segment -> (FakeHandle -> MockDBMT m a) -> MockDBMT m a
+    writeToSeg segment f = do
+        res <- f $ FakeHandle (segPath Interrupted segment) 
+        renameFakeFile (segPath Interrupted segment) (segPath Finished segment)
+        return res
+    loadSeg cs segment = (fmap (toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> get
+    -- segmentResource = SegmentResource {..}
+    -- maxWriteQueueLen = 16
+    -- maxReadQueueLen = 16
+    -- readQueueShardShift = 0
+    -- readerConfig = ReaderConfig {
+    --         lruSize = 16,
+    --         maxOpenSegs = 16
+    --     }
+    -- consumerLimits = ConsumerLimits {
+    --         cutoffCount = 1024,
+    --         cutoffLength = 1024*1024
+    --     }
+
+
 data DBState m = DBState {
     dbReaders :: ReadCache m,
     dbReaderExn :: Async m Void,
@@ -463,24 +520,18 @@ loadInitSeg run SegmentResource{..} status = case status of
                 () :> _savedOffs <- run hdl $ consumeFile @n config fakeWriteQ
                 return (succ partialSeg)
 
-setup :: DBConfig IO -> IO (DBState IO)
+setup :: DBConfig IO Handle -> IO (DBState IO)
 setup DBConfig{..} = do
     let run hdl write = runHandleT (runBufferT write) hdl
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
-    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
-    hotCache <- liftIO $ newMVar (initSeg, mempty)
-    (writer, writerExn) <- liftIO $ spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
+    (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
+    hotCache <- newMVar (initSeg, mempty)
+    (writer, writerExn) <- spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
 
-data InitResult = NoData | CleanShutdown Segment | AbruptShutdown Segment 
 
-
--- data SegmentResource m resource = SegmentResource {
---     writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
---     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
--- }
 
 data InitResult' k  = NoData' | CleanShutdown' Segment k | AbruptShutdown' Segment k 
 
@@ -561,7 +612,7 @@ spawnWriter run liftN hotCache maxWriteQueueLen initSeg SegmentResource{..} cons
     return (writeQ, exn)
 
 spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) 
-             => Int -> Int -> (Segment -> m (Maybe (m ByteString))) -> ReaderConfig m -> m (Readers m, Async m void)
+             => Int -> Int -> (Segment -> m (Maybe (m ByteString))) -> ReaderConfig -> m (Readers m, Async m void)
 spawnReaders qLen shardShift openSeg cfg = do
     let spawn = do
             readQ <- readQueue qLen
@@ -588,18 +639,6 @@ setRange lo hi set = (tooLow, good, tooHigh)
 -- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
 -- wrt that segment) and passes it to the GC
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
-
-
--- data SegmentResource m resource = SegmentResource {
---     -- Does not save intermediate progress. If the program crashes, 
---     -- the overwrite will be lost. Upon completion of overwrite, replaces 
---     -- the Finished file and deletes any interrupted file (if present)
---     overwriteSeg :: (forall a . Segment -> (resource -> m a) -> m a),
---     -- If interrupted, leaves the results in a predictable place
---     writeToSeg :: (forall a . Segment -> (resource -> m a) -> m a),
---     loadSeg :: CrashState -> Segment -> m (Maybe (m ByteString))
--- }
-
 
 
 spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
@@ -940,16 +979,21 @@ finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     let offsets = OffsetVector (VS.fromList (keys entries))
     writeOffsetsTo offsets
 
--- demo :: IO () 
--- demo = do
---     let cfg = defaultDBConfig "/tmp/rundir"
---     state <- runDBM (setup cfg)
---     let wq = dbWriter state
---     writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
---     (refs,flushes) <- unzip <$> mapM wait writes
---     flushWriteQueue wq
---     mapM_ takeMVar flushes
---     print $ length refs
+demo :: IO () 
+demo = do
+    let cfg = defaultDBConfig "/tmp/rundir"
+    putStrLn "Setting up"
+    state <- setup cfg
+    putStrLn "Writing"
+    let wq = dbWriter state
+    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
+    putStrLn "Waiting"
+    (refs,flushes) <- unzip <$> mapM wait writes
+    putStrLn "Flushing"
+    flushWriteQueue wq
+    putStrLn "Waiting for flush"
+    mapM_ takeMVar flushes
+    print $ length refs
 
 
 
