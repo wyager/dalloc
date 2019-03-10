@@ -1012,5 +1012,15 @@ demo = do
     print $ length refs
 
 
+demoMock :: MockDBMT Identity Int
+demoMock = do
+    let cfg = mockDBConfig
+    state <- setupMock cfg
+    let wq = dbWriter state
+    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
+    (refs,flushes) <- unzip <$> mapM wait writes
+    flushWriteQueue wq
+    mapM_ takeMVar flushes
+    return $ length refs
 
 
