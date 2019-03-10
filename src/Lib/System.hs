@@ -476,19 +476,19 @@ mockDBConfig  = undefined -- DBConfig{..}
         res <- f $ FakeHandle (segPath Interrupted segment) 
         renameFakeFile (segPath Interrupted segment) (segPath Finished segment)
         return res
-    loadSeg cs segment = (fmap (toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> get
-    -- segmentResource = SegmentResource {..}
-    -- maxWriteQueueLen = 16
-    -- maxReadQueueLen = 16
-    -- readQueueShardShift = 0
-    -- readerConfig = ReaderConfig {
-    --         lruSize = 16,
-    --         maxOpenSegs = 16
-    --     }
-    -- consumerLimits = ConsumerLimits {
-    --         cutoffCount = 1024,
-    --         cutoffLength = 1024*1024
-    --     }
+    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> get
+    segmentResource = SegmentResource {..}
+    maxWriteQueueLen = 16
+    maxReadQueueLen = 16
+    readQueueShardShift = 0
+    readerConfig = ReaderConfig {
+            lruSize = 16,
+            maxOpenSegs = 16
+        }
+    consumerLimits = ConsumerLimits {
+            cutoffCount = 1024,
+            cutoffLength = 1024*1024
+        }
 
 
 data DBState m = DBState {
