@@ -159,7 +159,6 @@ flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 -- -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
 
 data ReaderConfig m = ReaderConfig {
-        openSeg     :: Segment -> m ByteString,
         lruSize     :: Int,
         maxOpenSegs :: Int
     }
@@ -280,6 +279,7 @@ data IrrecoverableFailure
     | IFStoredOffsetsDecodeEx StoredOffsetsDecodeEx
     | IFSegmentStreamError SegmentStreamError
     | IFGCError GCError
+    | IFSegmentNotFoundEx SegmentNotFoundEx
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
@@ -293,6 +293,7 @@ instance MultiError OffsetDecodeEx         IO where throw = liftIO . throwIO . I
 instance MultiError ReaderConsistencyError IO where throw = liftIO . throwIO . IFReaderConsistencyError
 instance MultiError StoredOffsetsDecodeEx  IO where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
 instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . IFSegmentStreamError
+instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . IFSegmentNotFoundEx
 
 newtype MockDBMT m a = MockDBMT {runMockDBMT :: ExceptT IrrecoverableFailure m a}
     deriving newtype (Functor, Applicative, Monad)
@@ -303,10 +304,13 @@ instance Monad m => MultiError OffsetDecodeEx         (MockDBMT m) where throw =
 instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw = MockDBMT . throwError . IFReaderConsistencyError
 instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = MockDBMT . throwError . IFStoredOffsetsDecodeEx
 instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = MockDBMT . throwError . IFSegmentStreamError
+instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = MockDBMT . throwError . IFSegmentNotFoundEx
 
 
-reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) => ReaderConfig m -> ReadQueue m -> m void
-reader ReaderConfig{..} (ReadQueue q) = go initial
+data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
+
+reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) => (Segment -> m (Maybe (m ByteString))) -> ReaderConfig m -> ReadQueue m -> m void
+reader openSeg ReaderConfig{..} (ReadQueue q) = go initial
     where
     initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
     go state = do
@@ -316,7 +320,7 @@ reader ReaderConfig{..} (ReadQueue q) = go initial
             Nothing -> return ()
             Just seg -> do
                 serializer <- async $ do
-                    bs <- openSeg seg
+                    bs <- maybe (throw (SegmentNotFoundEx seg)) id =<< openSeg seg
                     loaded <- evaluateM $ force $ loadOffsets bs
                     let toSend = case loaded of
                             Right offsets -> ReadComplete seg $ MMapped offsets bs
@@ -421,9 +425,6 @@ defaultDBConfig rundir = DBConfig{..}
     maxReadQueueLen = 16
     readQueueShardShift = 0
     readerConfig = ReaderConfig {
-            openSeg = (\seg -> (loadSeg Finished seg >>= \case
-                Nothing -> error "Segment doesn't exist. TODO: Remove this"
-                Just load -> load)),
             lruSize = 16,
             maxOpenSegs = 16
         }
@@ -467,7 +468,7 @@ setup DBConfig{..} = do
     let run hdl write = runHandleT (runBufferT write) hdl
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
-    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift  readerConfig
+    (readers, readersExn) <- liftIO $ spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- liftIO $ newMVar (initSeg, mempty)
     (writer, writerExn) <- liftIO $ spawnWriter run (lift . lift) hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
@@ -559,12 +560,12 @@ spawnWriter run liftN hotCache maxWriteQueueLen initSeg SegmentResource{..} cons
     exn <- async $ flip evalStateT initSeg $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
-spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx] m) 
-             => Int -> Int -> ReaderConfig m -> m (Readers m, Async m void)
-spawnReaders qLen shardShift cfg = do
+spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) 
+             => Int -> Int -> (Segment -> m (Maybe (m ByteString))) -> ReaderConfig m -> m (Readers m, Async m void)
+spawnReaders qLen shardShift openSeg cfg = do
     let spawn = do
             readQ <- readQueue qLen
-            thread <- async $ reader cfg readQ
+            thread <- async $ reader openSeg cfg readQ
             return (readQ, thread)
     spawned <- V.replicateM (2 ^ shardShift) spawn 
     let (queues, threads) = V.unzip spawned
