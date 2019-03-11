@@ -1,10 +1,10 @@
 module Main (main) where
 
-import Lib.System (demoMock)
+import Lib.System (demo)
 
 -- import Test.DejaFu.Conc as Conc
--- main :: IO ()
--- main = demo
+main :: IO ()
+main = demo
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)

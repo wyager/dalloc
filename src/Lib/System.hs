@@ -4,7 +4,7 @@ module Lib.System where
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait, waitCatch)
 -- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar)
+import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar, modifyMVar_)
 -- import           Control.Concurrent.STM.TVar (TVar)
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception,evaluate, throwIO, SomeException, catch)
@@ -44,7 +44,7 @@ import           Control.Monad.Except (ExceptT, throwError, runExceptT)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
-import           Control.Monad.Reader (ReaderT(..), ask)
+import           Control.Monad.Reader (ReaderT(..), ask, MonadReader)
 import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT, state, MonadState)
 import           Control.Monad.Identity (Identity(..))
 import           Control.Monad.Random.Class (MonadRandom, getRandomR)
@@ -298,14 +298,13 @@ instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . I
 instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . IFSegmentNotFoundEx
 
 
-
-instance Monad m => MultiError IndexError             (MockDBMT m) where throw = MockDBMT . lift . throwError . IFIndexError
-instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = MockDBMT . lift . throwError . IFCacheConsistencyError
-instance Monad m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = MockDBMT . lift . throwError . IFOffsetDecodeEx
-instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw = MockDBMT . lift . throwError . IFReaderConsistencyError
-instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = MockDBMT . lift . throwError . IFStoredOffsetsDecodeEx
-instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = MockDBMT . lift . throwError . IFSegmentStreamError
-instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = MockDBMT . lift . throwError . IFSegmentNotFoundEx
+instance MonadIO m => MultiError IndexError             (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError CacheConsistencyError  (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError ReaderConsistencyError (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError SegmentStreamError     (MockDBMT m) where throw = liftIO . throw
+instance MonadIO m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = liftIO . throw
 
 
 data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
@@ -435,33 +434,42 @@ defaultDBConfig rundir = DBConfig{..}
         }
 
 
-newtype MockDBMT m a = MockDBMT (ConcT (StateT (Map FilePath Builder) (ExceptT IrrecoverableFailure m)) a)
-    deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask)
 
-instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
 
--- runMockDBMT :: Map FilePath Builder -> MockDBMT m a -> ConcT m (Either IrrecoverableFailure (a,Map FilePath Builder))
--- runMockDBMT s0 (MockDBMT m) = lift $ runExceptT $ runStateT m s0 
+newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) m a)
+    deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO)
+
+-- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
+
+runMockDBMT :: MonadConc m => Map FilePath Builder -> MockDBMT m a -> m a
+runMockDBMT s0 (MockDBMT m) = runReaderT m =<< newMVar s0
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
-writeToFakeHandle :: Monad m => FakeHandle -> Builder -> MockDBMT m ()
-writeToFakeHandle (FakeHandle path) builder = modify (Map.insertWith (flip (<>)) path builder)
+mockPure :: MonadConc m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
+mockPure f = MockDBMT $ do
+    mvar <- ask 
+    lift $ modifyMVar mvar (return . f)
 
-deleteFakeFile :: Monad m => FilePath -> MockDBMT m ()
-deleteFakeFile hdl = modify (Map.delete hdl)
+mockPure_ :: MonadConc m => (Map FilePath Builder -> Map FilePath Builder) -> MockDBMT m ()
+mockPure_ f = mockPure (\x -> (f x,()))
 
-renameFakeFile :: Monad m => FilePath -> FilePath -> MockDBMT m ()
-renameFakeFile oldName newName = do
-    old <- state $ alterF (\old -> (old, Nothing)) oldName
-    -- NB: Should we complain if it doesn't exist?
-    modify $ alter (const old) newName
+writeToFakeHandle :: MonadConc m => FakeHandle -> Builder -> MockDBMT m ()
+writeToFakeHandle (FakeHandle path) builder = mockPure_ $ (Map.insertWith (flip (<>)) path builder) 
 
-doesFakeFileExist :: Monad m => FilePath -> MockDBMT m Bool
-doesFakeFileExist path = Map.member path <$> get
+deleteFakeFile :: MonadConc m => FilePath -> MockDBMT m ()
+deleteFakeFile hdl = mockPure_ (Map.delete hdl)
+
+renameFakeFile :: MonadConc m => FilePath -> FilePath -> MockDBMT m ()
+renameFakeFile oldName newName = mockPure_ $ \oldMap ->
+    let (oldFile, deletedFS) = alterF (\old -> (old, Nothing)) oldName oldMap in
+    alter (const oldFile) newName deletedFS
+
+doesFakeFileExist :: MonadConc m => FilePath -> MockDBMT m Bool
+doesFakeFileExist path = mockPure $ \map -> (map, Map.member path map)
 
 
-mockDBConfig :: forall m . Monad m => DBConfig (MockDBMT m) FakeHandle
+mockDBConfig :: forall m . MonadConc m => DBConfig (MockDBMT m) FakeHandle
 mockDBConfig  = undefined -- DBConfig{..}
     where
     segPath cs seg = show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
@@ -482,7 +490,7 @@ mockDBConfig  = undefined -- DBConfig{..}
         res <- f $ FakeHandle (segPath Interrupted segment) 
         renameFakeFile (segPath Interrupted segment) (segPath Finished segment)
         return res
-    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> get
+    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\map -> (map,map))
     segmentResource = SegmentResource {..}
     maxWriteQueueLen = 16
     maxReadQueueLen = 16
@@ -526,7 +534,9 @@ loadInitSeg run SegmentResource{..} status = case status of
                 () :> _savedOffs <- run (consumeFile @n config fakeWriteQ) hdl
                 return (succ partialSeg)
 
-
+-- NB: Setup is completely pure. An instantiation of this function need not use IO.
+-- I was hoping to be able to write setupMock without even using MonadIO, but due
+-- to the structure of dejafu (esp. wrt. exceptions) I was unable to.
 setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
           Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m, 
           Throws '[SegmentStreamError] n, Writable n) 
@@ -544,10 +554,12 @@ setupIO = setup run (lift . lift)
     where run write = runHandleT (runBufferT write)
 
 
-instance Monad m => MonadEvaluate (MockDBMT m) where
-    evaluateM = return
+instance MonadIO m => MonadEvaluate (MockDBMT m) where
+    evaluateM = liftIO . evaluate
 
-setupMock :: Monad m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
+-- Introduce MonadIO here only for exception catching that supports DejaFu
+-- (and MonadEvaluate, although we could just put evaluateM = return if we wanted)
+setupMock :: (MonadConc m, MonadIO m) => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
 setupMock = setup run lift
     where 
     run write hdl = do
@@ -1012,8 +1024,8 @@ demo = do
     print $ length refs
 
 
-demoMock :: MockDBMT Identity Int
-demoMock = do
+demoMock :: (MonadIO m, MonadConc m) => m Int
+demoMock = runMockDBMT Map.empty $ do
     let cfg = mockDBConfig
     state <- setupMock cfg
     let wq = dbWriter state
