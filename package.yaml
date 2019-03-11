@@ -108,6 +108,7 @@ executables:
     - streaming
     - stm
     - async
+    - dejafu
     
 
 tests:

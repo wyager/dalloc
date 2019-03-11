@@ -470,7 +470,7 @@ doesFakeFileExist path = mockPure $ \map -> (map, Map.member path map)
 
 
 mockDBConfig :: forall m . MonadConc m => DBConfig (MockDBMT m) FakeHandle
-mockDBConfig  = undefined -- DBConfig{..}
+mockDBConfig  = DBConfig{..}
     where
     segPath cs seg = show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
 
@@ -492,16 +492,16 @@ mockDBConfig  = undefined -- DBConfig{..}
         return res
     loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\map -> (map,map))
     segmentResource = SegmentResource {..}
-    maxWriteQueueLen = 16
-    maxReadQueueLen = 16
+    maxWriteQueueLen = 4
+    maxReadQueueLen = 4
     readQueueShardShift = 0
     readerConfig = ReaderConfig {
-            lruSize = 16,
-            maxOpenSegs = 16
+            lruSize = 4,
+            maxOpenSegs = 4
         }
     consumerLimits = ConsumerLimits {
-            cutoffCount = 1024,
-            cutoffLength = 1024*1024
+            cutoffCount = 32,
+            cutoffLength = 1024
         }
 
 
@@ -569,7 +569,7 @@ setupMock = setup run lift
 
 data InitResult' k  = NoData' | CleanShutdown' Segment k | AbruptShutdown' Segment k 
 
-
+-- TODO: Not initializing if there's stuff already there
 initialize' :: Monad m => (CrashState -> Segment -> m (Maybe k)) -> m (InitResult' k)
 initialize' find = do
     find Finished 0 >>= \case
@@ -1016,23 +1016,28 @@ demo = do
     let wq = dbWriter state
     writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
     putStrLn "Waiting"
-    (refs,flushes) <- unzip <$> mapM wait writes
+    numRefs <- async $ do
+        (refs,flushes) <- unzip <$> mapM wait writes
+        mapM_ takeMVar flushes
+        return (length refs)
     putStrLn "Flushing"
     flushWriteQueue wq
     putStrLn "Waiting for flush"
-    mapM_ takeMVar flushes
-    print $ length refs
+    (_, numRefs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
+    print numRefs
 
-
-demoMock :: (MonadIO m, MonadConc m) => m Int
+demoMock :: (MonadIO m, MonadConc m) => m ()
 demoMock = runMockDBMT Map.empty $ do
     let cfg = mockDBConfig
     state <- setupMock cfg
     let wq = dbWriter state
-    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
-    (refs,flushes) <- unzip <$> mapM wait writes
+    writes <- replicateM (2) (storeToQueue wq (ByteString.replicate (4) 0x44))
+    numRefs <- async $ do
+        (refs,flushes) <- unzip <$> mapM wait writes
+        return (length refs, flushes)
+    (_, (numRefs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
     flushWriteQueue wq
     mapM_ takeMVar flushes
-    return $ length refs
+    liftIO $ print numRefs
 
 
