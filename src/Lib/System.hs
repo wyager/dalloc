@@ -438,8 +438,14 @@ defaultDBConfig rundir = DBConfig{..}
 
 
 
-
-newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) (ReaderT (IrrecoverableFailure -> m Void) m) a)
+-- One ReaderT holds a reference to the mock filesystem. The other ReaderT holds a function that
+-- lets us throw exceptions. DejaFu doesn't seem to support e.g. ExceptT, so instead we use
+-- IO exceptions, but I want to leave "MonadIO" constrains as far outside of the mocking
+-- logic as possible - the mock system should be observationally pure for the most accurate
+-- and useful tests.
+newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) -- Fake filesystem
+                                    (ReaderT (IrrecoverableFailure -> m Void) -- Exception throwing. Use Void because GHC doesn't like an existential here
+                                        m) a)
     deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO)
 
 -- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
