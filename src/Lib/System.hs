@@ -298,13 +298,16 @@ instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . I
 instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . IFSegmentNotFoundEx
 
 
-instance MonadIO m => MultiError IndexError             (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError CacheConsistencyError  (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError ReaderConsistencyError (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError SegmentStreamError     (MockDBMT m) where throw = liftIO . throw
-instance MonadIO m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = liftIO . throw
+mockThrow :: Monad m => IrrecoverableFailure -> MockDBMT m a
+mockThrow failure = fmap absurd . MockDBMT . lift $ ask >>= \throw -> lift (throw failure)
+
+instance Monad m => MultiError IndexError             (MockDBMT m) where throw = mockThrow . IFIndexError
+instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = mockThrow . IFCacheConsistencyError
+instance Monad m => MultiError OffsetDecodeEx         (MockDBMT m) where throw = mockThrow . IFOffsetDecodeEx
+instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw = mockThrow . IFReaderConsistencyError
+instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = mockThrow . IFStoredOffsetsDecodeEx
+instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = mockThrow . IFSegmentStreamError
+instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = mockThrow . IFSegmentNotFoundEx
 
 
 data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
@@ -436,13 +439,13 @@ defaultDBConfig rundir = DBConfig{..}
 
 
 
-newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) m a)
+newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) (ReaderT (IrrecoverableFailure -> m Void) m) a)
     deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO)
 
 -- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
 
-runMockDBMT :: MonadConc m => Map FilePath Builder -> MockDBMT m a -> m a
-runMockDBMT s0 (MockDBMT m) = runReaderT m =<< newMVar s0
+runMockDBMT :: MonadConc m => (forall x . IrrecoverableFailure -> m x) -> Map FilePath Builder -> MockDBMT m a -> m a
+runMockDBMT throw s0 (MockDBMT m) = newMVar s0 >>= \s -> runReaderT (runReaderT m s) throw
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
@@ -554,12 +557,12 @@ setupIO = setup run (lift . lift)
     where run write = runHandleT (runBufferT write)
 
 
-instance MonadIO m => MonadEvaluate (MockDBMT m) where
-    evaluateM = liftIO . evaluate
+instance Monad m => MonadEvaluate (MockDBMT m) where
+    evaluateM = return
 
 -- Introduce MonadIO here only for exception catching that supports DejaFu
 -- (and MonadEvaluate, although we could just put evaluateM = return if we wanted)
-setupMock :: (MonadConc m, MonadIO m) => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
+setupMock :: MonadConc m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
 setupMock = setup run lift
     where 
     run write hdl = do
@@ -1027,7 +1030,7 @@ demo = do
     print numRefs
 
 demoMock :: (MonadIO m, MonadConc m) => m ()
-demoMock = runMockDBMT Map.empty $ do
+demoMock = runMockDBMT (liftIO . throwIO) Map.empty $ do
     let cfg = mockDBConfig
     state <- setupMock cfg
     let wq = dbWriter state
