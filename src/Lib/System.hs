@@ -22,7 +22,6 @@ import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile, withFil
 import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
-import           Lib.StoreStream (sized)
 import qualified Data.Vector.Storable as VS
 import qualified Data.Vector as V
 import           Data.LruCache as Lru (LruCache, empty, lookup, insertView)
@@ -144,9 +143,8 @@ instance MonadEvaluate IO where
 readQueue :: MonadConc m => Int -> m (ReadQueue m)
 readQueue _maxLen = ReadQueue <$> newChan
 
-storeToQueue :: (Store a, MonadConc m, MonadEvaluate m) => WriteQueue m -> a -> m (Async m (Ref, MVar m Flushed))
-storeToQueue (WriteQueue q) value = async $ do
-    bs <- evaluateM $ force $ encode $ sized value
+storeToQueue :: (MonadConc m, MonadEvaluate m) => WriteQueue m -> ByteString -> m (Async m (Ref, MVar m Flushed))
+storeToQueue (WriteQueue q) bs = async $ do
     saved <- newEmptyMVar
     flushed <- newEmptyMVar
     writeChan q $ Write saved flushed bs
@@ -1040,6 +1038,8 @@ demo = do
     (_, numRefs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
     print numRefs
 
+-- readViaReadCache :: MonadConc m => Ref -> ReadCache m -> m (Async m ByteString)
+
 demoMock :: (MonadIO m, MonadConc m) => m ()
 demoMock = do
     fsState <- newMVar Map.empty
@@ -1048,13 +1048,14 @@ demoMock = do
         let cfg = mockDBConfig
         state <- setupMock cfg
         let wq = dbWriter state
-        writes <- replicateM (2) (storeToQueue wq (ByteString.replicate (4) 0x44))
-        numRefs <- async $ do
-            (refs,flushes) <- unzip <$> mapM wait writes
-            return (length refs, flushes)
-        (_, (numRefs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
+        let rc = dbReaders state
+        writes <- mapM (storeToQueue wq . ByteString.replicate (4)) [0x44,0x45]
+        refs <- async $ unzip <$> mapM wait writes
+        (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refs]
         flushWriteQueue wq
         mapM_ takeMVar flushes
-        liftIO $ print numRefs
+        readAll <- mapM (`readViaReadCache` rc) refs 
+        (_, readValue) <- waitAny readAll
+        liftIO $ print (length refs, readValue)
 
 

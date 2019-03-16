@@ -7,7 +7,7 @@ import           Data.Store (Store, Size(VarSize, ConstSize), size, peek, poke, 
 import           Data.Word (Word64)
 import           Data.ByteString (ByteString)
 
-data Sized a = Sized !Word64 !a 
+data Sized a = Sized {sizedSize :: !Word64, getSized :: !a} 
 
 
 instance Store a => Store (Sized a) where
