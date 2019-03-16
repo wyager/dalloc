@@ -290,7 +290,7 @@ instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . I
 
 
 mockThrow :: Monad m => IrrecoverableFailure -> MockDBMT m a
-mockThrow failure = fmap absurd . MockDBMT . lift $ ask >>= \throw -> lift (throw failure)
+mockThrow failure = fmap absurd . MockDBMT . lift $ ask >>= \mThrow -> lift (mThrow failure)
 
 instance Monad m => MultiError IndexError             (MockDBMT m) where throw = mockThrow . IFIndexError
 instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = mockThrow . IFCacheConsistencyError
@@ -303,8 +303,8 @@ instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw =
 
 data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
 
-reader :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) => (Segment -> m (Maybe (m ByteString))) -> ReaderConfig -> ReadQueue m -> m void
-reader openSeg ReaderConfig{..} (ReadQueue q) = go initial
+readerMain :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) => (Segment -> m (Maybe (m ByteString))) -> ReaderConfig -> ReadQueue m -> m void
+readerMain openSeg ReaderConfig{..} (ReadQueue q) = go initial
     where
     initial = ReaderState (Lru.empty lruSize) (emptySegmentCache maxOpenSegs) Map.empty
     go state = do
@@ -444,7 +444,7 @@ newtype MockDBMT m a = MockDBMT (ReaderT (FakeFilesystem m) -- Fake filesystem
 -- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
 
 runMockDBMT :: Monad m => (forall x . IrrecoverableFailure -> m x) -> FakeFilesystem m -> MockDBMT m a -> m a
-runMockDBMT throw fs (MockDBMT m) = runReaderT (runReaderT m fs) throw
+runMockDBMT mThrow mFS (MockDBMT m) = runReaderT (runReaderT m mFS) mThrow
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
@@ -471,7 +471,7 @@ renameFakeFile oldName newName = mockPure_ $ \oldMap ->
     alter (const oldFile) newName deletedFS
 
 doesFakeFileExist :: Monad m => FilePath -> MockDBMT m Bool
-doesFakeFileExist path = mockPure $ \map -> (map, Map.member path map)
+doesFakeFileExist path = mockPure $ \fs -> (fs, Map.member path fs)
 
 
 mockDBConfig :: forall m . Monad m => DBConfig (MockDBMT m) FakeHandle
@@ -495,7 +495,7 @@ mockDBConfig  = DBConfig{..}
         res <- f $ FakeHandle (segPath Interrupted segment) 
         renameFakeFile (segPath Interrupted segment) (segPath Finished segment)
         return res
-    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\map -> (map,map))
+    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\fs -> (fs,fs))
     segmentResource = SegmentResource {..}
     maxWriteQueueLen = 4
     maxReadQueueLen = 4
@@ -647,7 +647,7 @@ spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsist
 spawnReaders qLen shardShift openSeg cfg = do
     let spawn = do
             readQ <- readQueue qLen
-            thread <- async $ reader openSeg cfg readQ
+            thread <- async $ readerMain openSeg cfg readQ
             return (readQ, thread)
     spawned <- V.replicateM (2 ^ shardShift) spawn 
     let (queues, threads) = V.unzip spawned
@@ -680,7 +680,7 @@ spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDe
 spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
     where
     peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
-                                | null currentIxes = undefined "Just save an empty segment"
+                                -- | null currentIxes =  -- optimization: Just save an empty segment
                                 | otherwise = do
                                     let load = loadSeg Finished snapshotSegment >>= maybe (throw (GCSegmentLoadError snapshotSegment)) id 
                                     old_bs <- load
