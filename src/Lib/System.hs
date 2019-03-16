@@ -437,7 +437,7 @@ defaultDBConfig rundir = DBConfig{..}
         }
 
 
-
+-- Supports atomic read/write/rename
 newtype FakeFilesystem m = FakeFilesystem (forall b . (Map FilePath Builder -> (Map FilePath Builder,b)) -> m b)
 
 -- One ReaderT holds a reference to the mock filesystem. The other ReaderT holds a function that
@@ -460,30 +460,30 @@ newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
 -- MVar m (Map FilePath Builder)
 
-mockPure :: MonadConc m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
+mockPure :: Monad m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
 mockPure f = MockDBMT $ do
     FakeFilesystem fs <- ask 
     lift . lift $ fs f
 
-mockPure_ :: MonadConc m => (Map FilePath Builder -> Map FilePath Builder) -> MockDBMT m ()
+mockPure_ :: Monad m => (Map FilePath Builder -> Map FilePath Builder) -> MockDBMT m ()
 mockPure_ f = mockPure (\x -> (f x,()))
 
-writeToFakeHandle :: MonadConc m => FakeHandle -> Builder -> MockDBMT m ()
+writeToFakeHandle :: Monad m => FakeHandle -> Builder -> MockDBMT m ()
 writeToFakeHandle (FakeHandle path) builder = mockPure_ $ (Map.insertWith (flip (<>)) path builder) 
 
-deleteFakeFile :: MonadConc m => FilePath -> MockDBMT m ()
+deleteFakeFile :: Monad m => FilePath -> MockDBMT m ()
 deleteFakeFile hdl = mockPure_ (Map.delete hdl)
 
-renameFakeFile :: MonadConc m => FilePath -> FilePath -> MockDBMT m ()
+renameFakeFile :: Monad m => FilePath -> FilePath -> MockDBMT m ()
 renameFakeFile oldName newName = mockPure_ $ \oldMap ->
     let (oldFile, deletedFS) = alterF (\old -> (old, Nothing)) oldName oldMap in
     alter (const oldFile) newName deletedFS
 
-doesFakeFileExist :: MonadConc m => FilePath -> MockDBMT m Bool
+doesFakeFileExist :: Monad m => FilePath -> MockDBMT m Bool
 doesFakeFileExist path = mockPure $ \map -> (map, Map.member path map)
 
 
-mockDBConfig :: forall m . MonadConc m => DBConfig (MockDBMT m) FakeHandle
+mockDBConfig :: forall m . Monad m => DBConfig (MockDBMT m) FakeHandle
 mockDBConfig  = DBConfig{..}
     where
     segPath cs seg = show seg ++ (case cs of Finished -> ""; Interrupted -> "~") 
