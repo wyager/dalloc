@@ -4,7 +4,7 @@ import Lib.System (demoMock, demo)
 
 import Test.DejaFu (autocheck)
 main :: IO ()
-main = autocheck demoMock >>= print
+main = demo --  autocheck demoMock >>= print
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)

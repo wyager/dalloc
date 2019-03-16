@@ -587,21 +587,23 @@ initialize' find = do
             find Interrupted (binExact + 1) >>= \case
                 Nothing -> return $ CleanShutdown' binExact binLoad
                 Just k' -> return $ AbruptShutdown' (binExact + 1) k'
+
+exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> m (key, val)
+exponentialBounds find zero = go 1 zero
+    where 
+    go n highest = do
+        val <- find n
+        maybe (return highest) (go (n*2)) ((n,) <$> val)        
+-- invariant: There are certainly no keys higher than `hi` which might return `Just _`
+-- lo is guaranteed to return `Just _`
+-- find is monotonic
+binarySearch :: (Integral key, Eq key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> key -> m (key,val)
+binarySearch f = \(lo,lv) hi -> go lo lv hi 
     where
-    exponentialBounds :: (Num key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> m (key, val)
-    exponentialBounds find zero = go 1 zero
-        where 
-        go n highest = do
-            val <- find n
-            maybe (return highest) (go (n*2)) ((n,) <$> val)        
-    -- invariant: There are no keys higher than `hi` which might return `Just _`
-    binarySearch :: (Integral key, Eq key, Monad m) => (key -> m (Maybe val)) -> (key,val) -> key -> m (key,val)
-    binarySearch f (lo,lv) hi = go lo lv hi 
-        where
-        go lo lv hi | lo == hi = return (lo,lv)
-                    | otherwise = f test >>= maybe (go lo lv test) (\tv -> go test tv hi)
-                        where
-                        test = (lo + hi + 1) `div` 2
+    go lo lv hi | lo == hi = return (lo,lv)
+                | otherwise = f test >>= maybe (go lo lv (test - 1)) (\tv -> go test tv hi)
+                    where
+                    test = (lo + hi + 1) `div` 2
 
 
 
@@ -1022,17 +1024,17 @@ demo = do
     state <- setupIO cfg
     putStrLn "Writing"
     let wq = dbWriter state
-    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16*4096) 0x44))
+    writes <- replicateM (8*1024) (storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44))
     putStrLn "Waiting"
-    numRefs <- async $ do
+    refAsyncs <- async $ do
         (refs,flushes) <- unzip <$> mapM wait writes
         mapM_ takeMVar flushes
-        return (length refs)
+        return refs
     putStrLn "Flushing"
     flushWriteQueue wq
     putStrLn "Waiting for flush"
-    (_, numRefs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
-    print numRefs
+    (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
+    print (length refs)
 
 demoMock :: (MonadIO m, MonadConc m) => m ()
 demoMock = do
@@ -1044,8 +1046,8 @@ demoMock = do
         let wq = dbWriter state
         let rc = dbReaders state
         writes <- mapM (storeToQueue wq . ByteString.replicate (25)) [0x44,0x45]
-        refs <- async $ unzip <$> mapM wait writes
-        (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refs]
+        refsAsyncs <- async $ unzip <$> mapM wait writes
+        (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
         flushWriteQueue wq
         mapM_ takeMVar flushes
         readAll <- mapM (`readViaReadCache` rc) refs 
