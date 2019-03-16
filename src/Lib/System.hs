@@ -438,27 +438,32 @@ defaultDBConfig rundir = DBConfig{..}
 
 
 
+newtype FakeFilesystem m = FakeFilesystem (forall b . (Map FilePath Builder -> (Map FilePath Builder,b)) -> m b)
+
 -- One ReaderT holds a reference to the mock filesystem. The other ReaderT holds a function that
 -- lets us throw exceptions. DejaFu doesn't seem to support e.g. ExceptT, so instead we use
 -- IO exceptions, but I want to leave "MonadIO" constrains as far outside of the mocking
 -- logic as possible - the mock system should be observationally pure for the most accurate
 -- and useful tests.
-newtype MockDBMT m a = MockDBMT (ReaderT (MVar m (Map FilePath Builder)) -- Fake filesystem
+newtype MockDBMT m a = MockDBMT (ReaderT (FakeFilesystem m) -- Fake filesystem
                                     (ReaderT (IrrecoverableFailure -> m Void) -- Exception throwing. Use Void because GHC doesn't like an existential here
                                         m) a)
     deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO)
 
 -- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
 
-runMockDBMT :: MonadConc m => (forall x . IrrecoverableFailure -> m x) -> Map FilePath Builder -> MockDBMT m a -> m a
-runMockDBMT throw s0 (MockDBMT m) = newMVar s0 >>= \s -> runReaderT (runReaderT m s) throw
+runMockDBMT :: Monad m => (forall x . IrrecoverableFailure -> m x) -> FakeFilesystem m -> MockDBMT m a -> m a
+runMockDBMT throw fs (MockDBMT m) = runReaderT (runReaderT m fs) throw
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
+
+-- MVar m (Map FilePath Builder)
+
 mockPure :: MonadConc m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
 mockPure f = MockDBMT $ do
-    mvar <- ask 
-    lift $ modifyMVar mvar (return . f)
+    FakeFilesystem fs <- ask 
+    lift . lift $ fs f
 
 mockPure_ :: MonadConc m => (Map FilePath Builder -> Map FilePath Builder) -> MockDBMT m ()
 mockPure_ f = mockPure (\x -> (f x,()))
@@ -1036,17 +1041,20 @@ demo = do
     print numRefs
 
 demoMock :: (MonadIO m, MonadConc m) => m ()
-demoMock = runMockDBMT (liftIO . throwIO) Map.empty $ do
-    let cfg = mockDBConfig
-    state <- setupMock cfg
-    let wq = dbWriter state
-    writes <- replicateM (2) (storeToQueue wq (ByteString.replicate (4) 0x44))
-    numRefs <- async $ do
-        (refs,flushes) <- unzip <$> mapM wait writes
-        return (length refs, flushes)
-    (_, (numRefs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
-    flushWriteQueue wq
-    mapM_ takeMVar flushes
-    liftIO $ print numRefs
+demoMock = do
+    fsState <- newMVar Map.empty
+    let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
+    runMockDBMT (liftIO . throwIO) fs $ do
+        let cfg = mockDBConfig
+        state <- setupMock cfg
+        let wq = dbWriter state
+        writes <- replicateM (2) (storeToQueue wq (ByteString.replicate (4) 0x44))
+        numRefs <- async $ do
+            (refs,flushes) <- unzip <$> mapM wait writes
+            return (length refs, flushes)
+        (_, (numRefs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
+        flushWriteQueue wq
+        mapM_ takeMVar flushes
+        liftIO $ print numRefs
 
 
