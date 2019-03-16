@@ -2,12 +2,10 @@
 module Lib.System where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
-import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait, waitCatch)
--- import           Control.Concurrent (forkIO)
-import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar, modifyMVar_)
--- import           Control.Concurrent.STM.TVar (TVar)
+import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
+import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 import           Control.DeepSeq (NFData, rnf, force)
-import           Control.Exception (Exception,evaluate, throwIO, SomeException, catch)
+import           Control.Exception (Exception, evaluate, throwIO)
 import           Control.Concurrent.Classy.Chan (Chan, newChan, readChan, writeChan)
 import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
@@ -18,7 +16,7 @@ import           Data.ByteString (ByteString)
 import           Data.ByteString.Lazy (toStrict)
 import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString)
 import           Data.Foldable (toList)
-import           System.IO (Handle, hFlush, IOMode(WriteMode), openFile, withFile)
+import           System.IO (Handle, hFlush, IOMode(WriteMode), withFile)
 import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
@@ -35,24 +33,19 @@ import           Streaming (wrap, mapsM_)
 import           Data.Functor.Of (Of((:>)))
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Morph (MonadTrans, hoist)
-import           Numeric.Search.Range (searchFromTo)
-import           Numeric.Search (searchM, divForever, hiVal)
--- import           Control.Monad.Error.Class (MonadError, throwError)
 import           Control.Monad.IO.Class (MonadIO, liftIO)
-import           Control.Monad.Except (ExceptT, throwError, runExceptT)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
-import           Control.Monad.Reader (ReaderT(..), ask, MonadReader)
-import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT, state, MonadState)
-import           Control.Monad.Identity (Identity(..))
+import           Control.Monad.Reader (ReaderT(..), ask)
+import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT)
 import           Control.Monad.Random.Class (MonadRandom, getRandomR)
 import           Control.Monad (replicateM, forever)
-import           Data.Proxy (Proxy(Proxy))
 import           Data.Bits ((.&.), shiftL)
 import           Control.Concurrent.Classy (MonadConc)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
-import           Test.DejaFu.Conc (ConcT)
+import           Numeric.Search.Range (searchFromTo)
+
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded, Num, Real, Integral)
@@ -512,8 +505,8 @@ mockDBConfig  = DBConfig{..}
             maxOpenSegs = 4
         }
     consumerLimits = ConsumerLimits {
-            cutoffCount = 32,
-            cutoffLength = 1024
+            cutoffCount = 8,
+            cutoffLength = 128
         }
 
 
@@ -888,11 +881,13 @@ data RepackState = RepackState {
         repackMap :: Map Ix Offset
     }
 
+
 repackFile :: Writable m => Stream (Of (Ix, ByteString)) m r -> m (Of StoredOffsets r)
 repackFile = foldM step (return initial) finalize
     where
     step RepackState{..} (ix,bs) = do
-        writeM bs
+        writeM $ encode $ toEnum @Word64 $ ByteString.length bs
+        writeM bs 
         return (RepackState {repackOffset = repackOffset `plus` ByteString.length bs,
                              repackMap = Map.insert ix repackOffset repackMap})
     finalize RepackState{..} = do
@@ -976,7 +971,7 @@ consume' state@ConsumerState{..} = \case
         else (state {flushQueue = []}, Flush flushQueue)
     Write refVar flushed bs -> do
         let entries' = Map.insert writeOffset bs entries
-            writeOffset' = writeOffset `plus` ByteString.length bs
+            writeOffset' = writeOffset `plus` (ByteString.length bs + 8)
             ix = Ix (fromIntegral $ length entries)
         (state {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue},
             WriteToLog bs entries' refVar ix)
@@ -993,6 +988,7 @@ saveFile ConsumerConfig{..} action = case action of
             flushM
             mapM_ (`putMVar` Flushed) flushed
         WriteToLog bs entries refVar ix -> do
+            writeM $ encode $ toEnum @Word64 $ ByteString.length bs
             writeM bs
             -- This is a bit confusing: register is supposed to update the shared "hot" cache for the active write head.
             -- We *must* make a globally visible update to the hot cache before returning the ref, or else
@@ -1038,8 +1034,6 @@ demo = do
     (_, numRefs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, numRefs]
     print numRefs
 
--- readViaReadCache :: MonadConc m => Ref -> ReadCache m -> m (Async m ByteString)
-
 demoMock :: (MonadIO m, MonadConc m) => m ()
 demoMock = do
     fsState <- newMVar Map.empty
@@ -1049,13 +1043,13 @@ demoMock = do
         state <- setupMock cfg
         let wq = dbWriter state
         let rc = dbReaders state
-        writes <- mapM (storeToQueue wq . ByteString.replicate (4)) [0x44,0x45]
+        writes <- mapM (storeToQueue wq . ByteString.replicate (25)) [0x44,0x45]
         refs <- async $ unzip <$> mapM wait writes
         (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refs]
         flushWriteQueue wq
         mapM_ takeMVar flushes
         readAll <- mapM (`readViaReadCache` rc) refs 
         (_, readValue) <- waitAny readAll
-        liftIO $ print (length refs, readValue)
+        liftIO $ print (length refs, ByteString.length readValue)
 
 

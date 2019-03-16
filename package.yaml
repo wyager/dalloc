@@ -78,8 +78,8 @@ library:
   - mmorph
   - directory
   - lifted-async
-  - binary-search
   - containers
+  - binary-search
   - MonadRandom
   - concurrency
   - dejafu
