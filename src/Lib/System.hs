@@ -1051,11 +1051,10 @@ demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mock
     mapM_ takeMVar flushes
     readAll <- mapM (`readViaReadCache` rc) refs 
     (_, readValue) <- waitAny readAll
-    liftIO $ print (length refs, readValue)
+    return ()
 
 
-
-test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (DBState (MockDBMT m) -> MockDBMT m a) -> m (Map FilePath Builder, a)
+test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
@@ -1064,6 +1063,9 @@ test initialFS cfg theTest =  do
         theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)
+
+
+newtype RandomFilesystem = RandomFilesystem (Map FilePath Builder)
 
 
 
