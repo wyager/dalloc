@@ -1041,25 +1041,29 @@ demoIO = do
 
 -- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
 demoMock :: (MonadIO m, MonadConc m) => m (Map FilePath ByteString)
-demoMock = fmap (toStrict . toLazyByteString) <$> test Map.empty mockDBConfig
+demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ \state -> do
+    let wq = dbWriter state
+    let rc = dbReaders state
+    writes <- mapM (storeToQueue wq . ByteString.replicate (20)) $ take 2 [0x44..]
+    refsAsyncs <- async $ unzip <$> mapM wait writes
+    (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
+    flushWriteQueue wq
+    mapM_ takeMVar flushes
+    readAll <- mapM (`readViaReadCache` rc) refs 
+    (_, readValue) <- waitAny readAll
+    liftIO $ print (length refs, readValue)
 
 
-test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> m (Map FilePath Builder)
-test initialFS cfg = do
+
+test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (DBState (MockDBMT m) -> MockDBMT m a) -> m (Map FilePath Builder, a)
+test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
-    runMockDBMT (liftIO . throwIO) fs $ do
+    result <- runMockDBMT (liftIO . throwIO) fs $ do
         state <- setupMock cfg
-        let wq = dbWriter state
-        let rc = dbReaders state
-        writes <- mapM (storeToQueue wq . ByteString.replicate (20)) $ take 3 [0x44..]
-        refsAsyncs <- async $ unzip <$> mapM wait writes
-        (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
-        flushWriteQueue wq
-        mapM_ takeMVar flushes
-        readAll <- mapM (`readViaReadCache` rc) refs 
-        (_, readValue) <- waitAny readAll
-        liftIO $ print (length refs, readValue)
-    readMVar fsState
+        theTest state
+    finalFS <- readMVar fsState
+    return (finalFS, result)
+
 
 
