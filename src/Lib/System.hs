@@ -1,5 +1,5 @@
 {-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
-module Lib.System where
+module Lib.System (testProp, demoMock, demoIO) where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
@@ -45,7 +45,9 @@ import           Data.Bits ((.&.), shiftL)
 import           Control.Concurrent.Classy (MonadConc)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
 import           Numeric.Search.Range (searchFromTo)
-
+import           System.Random (RandomGen, randomR, random, newStdGen, randomRs)
+import qualified Crypto.Random as Random
+import           Data.Coerce (coerce)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded, Num, Real, Integral)
@@ -505,7 +507,7 @@ mockDBConfig  = DBConfig{..}
         }
     consumerLimits = ConsumerLimits {
             cutoffCount = 8,
-            cutoffLength = 128
+            cutoffLength = 256
         }
 
 
@@ -598,9 +600,9 @@ binarySearch :: (Integral key, Eq key, Monad m) => (key -> m (Maybe val)) -> (ke
 binarySearch f = \(lo,lv) hi -> go lo lv hi 
     where
     go lo lv hi | lo == hi = return (lo,lv)
-                | otherwise = f test >>= maybe (go lo lv (test - 1)) (\tv -> go test tv hi)
+                | otherwise = f testKey >>= maybe (go lo lv (testKey - 1)) (\tv -> go testKey tv hi)
                     where
-                    test = (lo + hi + 1) `div` 2
+                    testKey = (lo + hi + 1) `div` 2
 
 
 
@@ -1050,10 +1052,12 @@ demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mock
     flushWriteQueue wq
     mapM_ takeMVar flushes
     readAll <- mapM (`readViaReadCache` rc) refs 
-    (_, readValue) <- waitAny readAll
+    _ <- waitAny readAll
     return ()
 
 
+-- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
+-- If I can do that without MonadIO, I can get rid of it.
 test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
@@ -1067,5 +1071,43 @@ test initialFS cfg theTest =  do
 
 newtype RandomFilesystem = RandomFilesystem (Map FilePath Builder)
 
+genRandomFilesystem :: forall m g . (MonadIO m, MonadConc m, RandomGen g) => DBConfig (MockDBMT m) FakeHandle -> g -> m (Map FilePath Builder)
+genRandomFilesystem = \cfg g ->
+    fmap fst $ test Map.empty cfg $ \state -> do
+        let wq = dbWriter state
+        writes <- mapM (storeToQueue wq) $ randomBSs g
+        (_refs, flushes) <- unzip <$> mapM wait writes
+        flushWriteQueue wq
+        mapM_ takeMVar flushes
 
+
+randomBSs :: RandomGen g => g -> [ByteString]
+randomBSs g = fst $ Random.withDRG chacha $ mapM Random.getRandomBytes lens
+    where
+    (len, gSeed) = randomR (0,0xFF) g 
+    (seed, gLens) = random gSeed
+    lens = take len $ randomRs (0,0xFF) gLens
+    chacha = Random.drgNewTest (seed, 0, 0, 0, 0)
+
+
+readEqualsWrite :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBState m -> m Bool
+readEqualsWrite g state = do
+    let wq = dbWriter state
+    let rc = dbReaders state
+    let byteStrings = randomBSs g
+    writes <- mapM (storeToQueue wq) byteStrings
+    refsAsyncs <- async $ unzip <$> mapM wait writes
+    (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
+    flushWriteQueue wq
+    mapM_ takeMVar flushes
+    readAll <- mapM (`readViaReadCache` rc) refs 
+    readByteStrings <- mapM wait readAll
+    return (byteStrings == readByteStrings)
+
+{-# SPECIALIZE testProp :: IO Bool #-}
+testProp :: (MonadIO m, MonadConc m) => m Bool
+testProp = do
+    fs <- liftIO newStdGen >>= genRandomFilesystem mockDBConfig
+    (_fs', ok) <- liftIO newStdGen >>= \g -> test fs mockDBConfig (readEqualsWrite g)
+    return ok
 

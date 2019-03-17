@@ -84,6 +84,8 @@ library:
   - concurrency
   - dejafu
   - exceptions
+  - random
+  - cryptonite
   ghc-options:
   - -O2
   - -Wall

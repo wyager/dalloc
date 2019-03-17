@@ -1,10 +1,13 @@
 module Main (main) where
 
-import Lib.System (demoMock, demoIO)
+import Lib.System (demoMock, demoIO, testProp)
 
 import Test.DejaFu (autocheck)
+
+import Control.Monad (replicateM)
+
 main :: IO ()
-main = demoIO --  autocheck demoMock >>= print
+main = (and <$> replicateM 100 testProp) >>= print -- demoIO --  autocheck demoMock >>= print
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
