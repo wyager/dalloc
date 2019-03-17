@@ -448,7 +448,6 @@ runMockDBMT mThrow mFS (MockDBMT m) = runReaderT (runReaderT m mFS) mThrow
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
-
 -- MVar m (Map FilePath Builder)
 
 mockPure :: Monad m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
@@ -567,10 +566,8 @@ instance Monad m => MonadEvaluate (MockDBMT m) where
 setupMock :: MonadConc m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
 setupMock = setup run lift
     where 
-    run write hdl = do
-        (res,builder) <- runDummyFileT write
-        writeToFakeHandle hdl builder
-        return res
+    run write hdl = runDummyFileT write (writeToFakeHandle hdl) 
+
 
 data InitResult' k  = NoData' | CleanShutdown' Segment k | AbruptShutdown' Segment k 
 
@@ -819,18 +816,22 @@ runBufferT (BufferT state) = do
         writeMB builder
         return a
 
-newtype DummyFileT m a = DummyFileT (StateT Builder m a)
-    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadTrans, MonadConc, MonadThrow, MonadCatch, MonadMask)
+newtype DummyFileT m a = DummyFileT (ReaderT (Builder -> m ()) m a)
+    deriving newtype (Functor, Applicative, Monad, MonadIO, MonadConc, MonadThrow, MonadCatch, MonadMask)
+
+instance MonadTrans DummyFileT where
+    lift = DummyFileT . lift
+
 
 instance Monad m => Writable (DummyFileT m) where
     {-# INLINE writeM #-}
-    writeM bs = DummyFileT $ modify (<> byteString bs)
+    writeM bs = writeMB $ byteString bs
     {-# INLINE writeMB #-}
-    writeMB bd = DummyFileT $ modify (<> bd)
+    writeMB bd = DummyFileT $ ask >>= \f -> lift (f bd)
     flushM = return ()
 
-runDummyFileT :: DummyFileT m a -> m (a, Builder)
-runDummyFileT (DummyFileT state) = runStateT state mempty
+runDummyFileT :: DummyFileT m a -> (Builder -> m ()) -> m a
+runDummyFileT (DummyFileT reader) = runReaderT reader
 
 instance MultiError e m => MultiError e (DummyFileT m) where
     throw = lift . throw
@@ -1017,8 +1018,9 @@ finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     let offsets = OffsetVector (VS.fromList (keys entries))
     writeOffsetsTo offsets
 
-demo :: IO () 
-demo = do
+
+demoIO :: IO () 
+demoIO = do
     let cfg = defaultDBConfig "/tmp/rundir"
     putStrLn "Setting up"
     state <- setupIO cfg
@@ -1036,22 +1038,28 @@ demo = do
     (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
     print (length refs)
 
-demoMock :: (MonadIO m, MonadConc m) => m ()
-demoMock = do
-    fsState <- newMVar Map.empty
+
+-- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
+demoMock :: (MonadIO m, MonadConc m) => m (Map FilePath ByteString)
+demoMock = fmap (toStrict . toLazyByteString) <$> test Map.empty mockDBConfig
+
+
+test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> m (Map FilePath Builder)
+test initialFS cfg = do
+    fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
     runMockDBMT (liftIO . throwIO) fs $ do
-        let cfg = mockDBConfig
         state <- setupMock cfg
         let wq = dbWriter state
         let rc = dbReaders state
-        writes <- mapM (storeToQueue wq . ByteString.replicate (25)) [0x44,0x45]
+        writes <- mapM (storeToQueue wq . ByteString.replicate (20)) $ take 3 [0x44..]
         refsAsyncs <- async $ unzip <$> mapM wait writes
         (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
         flushWriteQueue wq
         mapM_ takeMVar flushes
         readAll <- mapM (`readViaReadCache` rc) refs 
         (_, readValue) <- waitAny readAll
-        liftIO $ print (length refs, ByteString.length readValue)
+        liftIO $ print (length refs, readValue)
+    readMVar fsState
 
 

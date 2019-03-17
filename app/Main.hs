@@ -1,10 +1,10 @@
 module Main (main) where
 
-import Lib.System (demoMock, demo)
+import Lib.System (demoMock, demoIO)
 
 import Test.DejaFu (autocheck)
 main :: IO ()
-main = demo --  autocheck demoMock >>= print
+main = demoIO --  autocheck demoMock >>= print
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
