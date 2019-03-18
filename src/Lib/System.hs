@@ -39,7 +39,6 @@ import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
 import           Control.Monad.Reader (ReaderT(..), ask)
 import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT)
-import           Control.Monad.Random.Class (MonadRandom, getRandomR)
 import           Control.Monad (replicateM, forever)
 import           Data.Bits ((.&.), shiftL)
 import           Control.Concurrent.Classy (MonadConc)
@@ -671,14 +670,16 @@ setRange lo hi set = (tooLow, good, tooHigh)
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
 
 
-spawnGcManager :: (Monad m, MonadRandom m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
-                   Writable n, Throws '[OffsetDecodeEx, GCError] n)
+spawnGcManager :: (Monad m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
+                   Writable n, Throws '[OffsetDecodeEx, GCError] n,
+                   RandomGen g)
                => (forall a . n a -> hdl -> m a) -> GcConfig ByteString 
                -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) 
+               -> g
                -> m void
-spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = forever (readChan completeSegs >>= peristaltize)
+spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = \gen -> forever (readChan completeSegs >>= peristaltize gen)
     where
-    peristaltize GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
+    peristaltize gen GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
                                 -- | null currentIxes =  -- optimization: Just save an empty segment
                                 | otherwise = do
                                     let load = loadSeg Finished snapshotSegment >>= maybe (throw (GCSegmentLoadError snapshotSegment)) id 
@@ -690,10 +691,10 @@ spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = forever 
                                     new_bs <- load
                                     registerGC snapshotSegment (MMapped new_offs new_bs)
                                     let olderRefs' = union olderRefs activeRefs
-                                    score <- getRandomR (0.0, 1.0 :: Double)
+                                        (score, gen') = randomR (0.0, 1.0 :: Double) gen
                                     if score < 0.1 || snapshotSegment == minBound
                                         then return ()
-                                        else peristaltize (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
+                                        else peristaltize gen' (GcSnapshot {snapshotRoots = olderRefs', snapshotSegment = pred snapshotSegment})
 
         where
         (olderRefs, currentRefs, newerRefs) = let (lo,hi) = segBound snapshotSegment in setRange lo hi snapshotRoots
