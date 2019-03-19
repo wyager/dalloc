@@ -5,7 +5,7 @@ import           Data.Store (Store, encode, decode, decodeEx, PeekException)
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
 import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 import           Control.DeepSeq (NFData, rnf, force)
-import           Control.Exception (Exception, evaluate, throwIO)
+import           Control.Exception (Exception, evaluate)
 import           Control.Concurrent.Classy.Chan (Chan, newChan, readChan, writeChan)
 import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
@@ -42,11 +42,10 @@ import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalS
 import           Control.Monad (replicateM, forever)
 import           Data.Bits ((.&.), shiftL)
 import           Control.Concurrent.Classy (MonadConc)
-import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask)
+import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask, throwM)
 import           Numeric.Search.Range (searchFromTo)
 import           System.Random (RandomGen, randomR, random, newStdGen, randomRs)
 import qualified Crypto.Random as Random
-import           Data.Coerce (coerce)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded, Num, Real, Integral)
@@ -279,15 +278,15 @@ data IrrecoverableFailure
 
 
 
-instance MultiError GCError               IO where throw = liftIO . throwIO . IFGCError
+instance MultiError GCError               IO where throw = throwM . IFGCError
 
-instance MultiError IndexError             IO where throw = liftIO . throwIO . IFIndexError
-instance MultiError CacheConsistencyError  IO where throw = liftIO . throwIO . IFCacheConsistencyError
-instance MultiError OffsetDecodeEx         IO where throw = liftIO . throwIO . IFOffsetDecodeEx
-instance MultiError ReaderConsistencyError IO where throw = liftIO . throwIO . IFReaderConsistencyError
-instance MultiError StoredOffsetsDecodeEx  IO where throw = liftIO . throwIO . IFStoredOffsetsDecodeEx
-instance MultiError SegmentStreamError     IO where throw = liftIO . throwIO . IFSegmentStreamError
-instance MultiError SegmentNotFoundEx      IO where throw = liftIO . throwIO . IFSegmentNotFoundEx
+instance MultiError IndexError             IO where throw = throwM . IFIndexError
+instance MultiError CacheConsistencyError  IO where throw = throwM . IFCacheConsistencyError
+instance MultiError OffsetDecodeEx         IO where throw = throwM . IFOffsetDecodeEx
+instance MultiError ReaderConsistencyError IO where throw = throwM . IFReaderConsistencyError
+instance MultiError StoredOffsetsDecodeEx  IO where throw = throwM . IFStoredOffsetsDecodeEx
+instance MultiError SegmentStreamError     IO where throw = throwM . IFSegmentStreamError
+instance MultiError SegmentNotFoundEx      IO where throw = throwM . IFSegmentNotFoundEx
 
 
 mockThrow :: Monad m => IrrecoverableFailure -> MockDBMT m a
@@ -1059,18 +1058,16 @@ demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mock
 
 -- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
 -- If I can do that without MonadIO, I can get rid of it.
-test :: (MonadIO m, MonadConc m) => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n -> n a) -> m (Map FilePath Builder, a)
+test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
-    result <- runMockDBMT (liftIO . throwIO) fs $ do
+    result <- runMockDBMT throwM fs $ do
         state <- setupMock cfg
         theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)
 
-
-newtype RandomFilesystem = RandomFilesystem (Map FilePath Builder)
 
 genRandomFilesystem :: forall m g . (MonadIO m, MonadConc m, RandomGen g) => DBConfig (MockDBMT m) FakeHandle -> g -> m (Map FilePath Builder)
 genRandomFilesystem = \cfg g ->
