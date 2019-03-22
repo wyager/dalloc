@@ -11,12 +11,34 @@ import           Control.Concurrent.Classy (MonadConc)
 import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString)
 import           Data.ByteString (ByteString)
+import qualified Data.ByteString as ByteString
+import           Data.ByteString.Lazy (toStrict)
+
+import           Test.Tasty.DejaFu (testDejafus)
+import           Test.Tasty.QuickCheck (testProperty)
+import           Test.Tasty (defaultMain, testGroup)
+import           Test.DejaFu (deadlocksNever, exceptionsNever)
 
 
 main :: IO ()
-main = do
-    quickCheck (ioProperty . readsFollowWrites)
+main = defaultMain $ testGroup "All tests" $ 
+    [ testProperty "Writing then reading works as expected" (ioProperty . readsFollowWrites)
+    , testDejafus [("No deadlocks", deadlocksNever), ("No exceptions", exceptionsNever)] demoMock
+    ]
 
+-- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
+demoMock :: MonadConc m => m (Map FilePath ByteString)
+demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ \state -> do
+    let wq = dbWriter state
+    let rc = dbReaders state
+    writes <- mapM (storeToQueue wq . ByteString.replicate (20)) $ take 2 [0x44..]
+    refsAsyncs <- async $ unzip <$> mapM wait writes
+    (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
+    flushWriteQueue wq
+    mapM_ takeMVar flushes
+    readAll <- mapM (`readViaReadCache` rc) refs 
+    _ <- waitAny readAll
+    return ()
 
 readsFollowWrites :: Int -> IO Bool
 readsFollowWrites seed = do

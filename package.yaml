@@ -89,6 +89,7 @@ library:
   ghc-options:
   - -O2
   - -Wall
+  - -fexpose-all-unfoldings
   # - -Werror
 
 executables:
@@ -122,6 +123,7 @@ tests:
     - -rtsopts
     - -with-rtsopts=-N1
     - -O2
+    - -fspecialize-aggressively
     dependencies:
     - dalloc
     - QuickCheck
@@ -130,3 +132,7 @@ tests:
     - concurrency
     - containers
     - bytestring
+    - tasty
+    - tasty-quickcheck
+    - tasty-dejafu
+    - dejafu

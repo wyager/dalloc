@@ -1,6 +1,6 @@
 module Main (main) where
 
-import Lib.System (demoMock, demoIO)
+import Lib.System (demoIO)
 
 import Test.DejaFu (autocheck)
 

@@ -7,7 +7,7 @@ import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, p
 import           Control.DeepSeq (NFData, rnf, force)
 import           Control.Exception (Exception, evaluate)
 import           Control.Concurrent.Classy.Chan (Chan, newChan, readChan, writeChan)
-import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
+import           Data.Map.Strict as Map (Map, member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
 import qualified Data.Map.Strict as Map (toList)
 import           Data.Set as Set (Set, insert, member, empty, union, spanAntitone)
 import qualified Data.Set as Set (map)
@@ -290,7 +290,9 @@ instance MultiError SegmentNotFoundEx      IO where throw = throwM . IFSegmentNo
 
 
 mockThrow :: Monad m => IrrecoverableFailure -> MockDBMT m a
-mockThrow failure = fmap absurd . MockDBMT . lift $ ask >>= \mThrow -> lift (mThrow failure)
+mockThrow failure = MockDBMT $ \ mThrow _fs -> fmap absurd $ mThrow failure
+
+ -- fmap absurd . MockDBMT . lift $ ask >>= \mThrow -> lift (mThrow failure)
 
 instance Monad m => MultiError IndexError             (MockDBMT m) where throw = mockThrow . IFIndexError
 instance Monad m => MultiError CacheConsistencyError  (MockDBMT m) where throw = mockThrow . IFCacheConsistencyError
@@ -436,24 +438,23 @@ newtype FakeFilesystem m = FakeFilesystem (forall b . (Map FilePath Builder -> (
 -- IO exceptions, but I want to leave "MonadIO" constrains as far outside of the mocking
 -- logic as possible - the mock system should be observationally pure for the most accurate
 -- and useful tests.
-newtype MockDBMT m a = MockDBMT (ReaderT (FakeFilesystem m) -- Fake filesystem
-                                    (ReaderT (IrrecoverableFailure -> m Void) -- Exception throwing. Use Void because GHC doesn't like an existential here
-                                        m) a)
-    deriving newtype (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO)
+newtype MockDBMT m a = MockDBMT ((IrrecoverableFailure -> m Void) -- Exception throwing. Use Void because GHC doesn't like an existential here
+                               -> FakeFilesystem m -- Fake filesystem
+                               -> m a)
+    deriving (Functor, Applicative, Monad, MonadConc, MonadThrow, MonadCatch, MonadMask, MonadIO) 
+        via ReaderT (IrrecoverableFailure -> m Void) (ReaderT (FakeFilesystem m) m)
 
 -- instance Monad m => MonadState (Map FilePath Builder) (MockDBMT m) where state = MockDBMT . lift . state
 
 runMockDBMT :: Monad m => (forall x . IrrecoverableFailure -> m x) -> FakeFilesystem m -> MockDBMT m a -> m a
-runMockDBMT mThrow mFS (MockDBMT m) = runReaderT (runReaderT m mFS) mThrow
+runMockDBMT mThrow mFS (MockDBMT m) = m mThrow mFS
 
 newtype FakeHandle = FakeHandle FilePath deriving (Eq,Ord,Show)
 
 -- MVar m (Map FilePath Builder)
 
 mockPure :: Monad m => (Map FilePath Builder -> (Map FilePath Builder,b)) -> MockDBMT m b
-mockPure f = MockDBMT $ do
-    FakeFilesystem fs <- ask 
-    lift . lift $ fs f
+mockPure f = MockDBMT $ \_ (FakeFilesystem fs) -> fs f
 
 mockPure_ :: Monad m => (Map FilePath Builder -> Map FilePath Builder) -> MockDBMT m ()
 mockPure_ f = mockPure (\x -> (f x,()))
@@ -617,7 +618,7 @@ data Readers m = Readers {shardShift :: Int,
 readViaReaders :: MonadConc m => Ref -> Readers m -> m (MVar m ByteString)
 readViaReaders ref Readers{..} = do
     let segHash = hash (refSegment ref)
-        mask = (1 `shiftL` shardShift) - 1
+        mask = (1 `shiftL` shardShift) - 1 
         hash' = segHash .&. mask
         ReadQueue rq = shards V.! hash'
     readVar <- newEmptyMVar
@@ -1044,21 +1045,6 @@ demoIO = do
     putStrLn "Waiting for flush"
     (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
     print (length refs)
-
-
--- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
-demoMock :: (MonadIO m, MonadConc m) => m (Map FilePath ByteString)
-demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ \state -> do
-    let wq = dbWriter state
-    let rc = dbReaders state
-    writes <- mapM (storeToQueue wq . ByteString.replicate (20)) $ take 2 [0x44..]
-    refsAsyncs <- async $ unzip <$> mapM wait writes
-    (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
-    flushWriteQueue wq
-    mapM_ takeMVar flushes
-    readAll <- mapM (`readViaReadCache` rc) refs 
-    _ <- waitAny readAll
-    return ()
 
 
 -- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
