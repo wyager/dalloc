@@ -120,6 +120,13 @@ tests:
     ghc-options:
     - -threaded
     - -rtsopts
-    - -with-rtsopts=-N
+    - -with-rtsopts=-N1
+    - -O2
     dependencies:
     - dalloc
+    - QuickCheck
+    - random 
+    - cryptonite
+    - concurrency
+    - containers
+    - bytestring

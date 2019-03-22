@@ -1,5 +1,5 @@
 {-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
-module Lib.System (testProp, demoMock, demoIO) where
+module Lib.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
@@ -14,7 +14,7 @@ import qualified Data.Set as Set (map)
 import qualified Data.ByteString as ByteString
 import           Data.ByteString (ByteString)
 import           Data.ByteString.Lazy (toStrict)
-import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString)
+import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString, lazyByteString)
 import           Data.Foldable (toList)
 import           System.IO (Handle, hFlush, IOMode(WriteMode), withFile)
 import           System.IO.MMap (mmapFileByteString)
@@ -44,8 +44,8 @@ import           Data.Bits ((.&.), shiftL)
 import           Control.Concurrent.Classy (MonadConc)
 import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask, throwM)
 import           Numeric.Search.Range (searchFromTo)
-import           System.Random (RandomGen, randomR, random, newStdGen, randomRs)
-import qualified Crypto.Random as Random
+import           System.Random (RandomGen, randomR)
+import           Data.Tuple (swap)
 
 newtype Segment = Segment Word64
     deriving newtype (Eq,Ord,Hashable, Store, Storable, Show, Enum, Bounded, Num, Real, Integral)
@@ -494,7 +494,12 @@ mockDBConfig  = DBConfig{..}
         res <- f $ FakeHandle (segPath Interrupted segment) 
         renameFakeFile (segPath Interrupted segment) (segPath Finished segment)
         return res
-    loadSeg cs segment = (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\fs -> (fs,fs))
+    loadSeg cs segment = do -- (fmap (return . toStrict . toLazyByteString) . (Map.!? (segPath cs segment))) <$> mockPure (\fs -> (fs,fs))
+        let clean = \case
+                Nothing -> (Nothing,Nothing)
+                Just file -> let lbs = toLazyByteString file in (Just (return $ toStrict lbs), Just (lazyByteString lbs))
+            simplify = swap . alterF clean (segPath cs segment) 
+        mockPure simplify
     segmentResource = SegmentResource {..}
     maxWriteQueueLen = 4
     maxReadQueueLen = 4
@@ -1069,43 +1074,7 @@ test initialFS cfg theTest =  do
     return (finalFS, result)
 
 
-genRandomFilesystem :: forall m g . (MonadIO m, MonadConc m, RandomGen g) => DBConfig (MockDBMT m) FakeHandle -> g -> m (Map FilePath Builder)
-genRandomFilesystem = \cfg g ->
-    fmap fst $ test Map.empty cfg $ \state -> do
-        let wq = dbWriter state
-        writes <- mapM (storeToQueue wq) $ randomBSs g
-        (_refs, flushes) <- unzip <$> mapM wait writes
-        flushWriteQueue wq
-        mapM_ takeMVar flushes
 
 
-randomBSs :: RandomGen g => g -> [ByteString]
-randomBSs g = fst $ Random.withDRG chacha $ mapM Random.getRandomBytes lens
-    where
-    (len, gSeed) = randomR (0,0xFF) g 
-    (seed, gLens) = random gSeed
-    lens = take len $ randomRs (0,0xFF) gLens
-    chacha = Random.drgNewTest (seed, 0, 0, 0, 0)
 
-
-readEqualsWrite :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBState m -> m Bool
-readEqualsWrite g state = do
-    let wq = dbWriter state
-    let rc = dbReaders state
-    let byteStrings = randomBSs g
-    writes <- mapM (storeToQueue wq) byteStrings
-    refsAsyncs <- async $ unzip <$> mapM wait writes
-    (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
-    flushWriteQueue wq
-    mapM_ takeMVar flushes
-    readAll <- mapM (`readViaReadCache` rc) refs 
-    readByteStrings <- mapM wait readAll
-    return (byteStrings == readByteStrings)
-
-{-# SPECIALIZE testProp :: IO Bool #-}
-testProp :: (MonadIO m, MonadConc m) => m Bool
-testProp = do
-    fs <- liftIO newStdGen >>= genRandomFilesystem mockDBConfig
-    (_fs', ok) <- liftIO newStdGen >>= \g -> test fs mockDBConfig (readEqualsWrite g)
-    return ok
 
