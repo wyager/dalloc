@@ -273,6 +273,7 @@ data IrrecoverableFailure
     | IFSegmentStreamError SegmentStreamError
     | IFGCError GCError
     | IFSegmentNotFoundEx SegmentNotFoundEx
+    | IFNoParse NoParse
     deriving stock (Typeable, Show)
     deriving anyclass Exception
 
@@ -287,6 +288,7 @@ instance MultiError ReaderConsistencyError IO where throw = throwM . IFReaderCon
 instance MultiError StoredOffsetsDecodeEx  IO where throw = throwM . IFStoredOffsetsDecodeEx
 instance MultiError SegmentStreamError     IO where throw = throwM . IFSegmentStreamError
 instance MultiError SegmentNotFoundEx      IO where throw = throwM . IFSegmentNotFoundEx
+instance MultiError NoParse                IO where throw = throwM . IFNoParse
 
 
 mockThrow :: Monad m => IrrecoverableFailure -> MockDBMT m a
@@ -301,6 +303,7 @@ instance Monad m => MultiError ReaderConsistencyError (MockDBMT m) where throw =
 instance Monad m => MultiError StoredOffsetsDecodeEx  (MockDBMT m) where throw = mockThrow . IFStoredOffsetsDecodeEx
 instance Monad m => MultiError SegmentStreamError     (MockDBMT m) where throw = mockThrow . IFSegmentStreamError
 instance Monad m => MultiError SegmentNotFoundEx      (MockDBMT m) where throw = mockThrow . IFSegmentNotFoundEx
+instance Monad m => MultiError NoParse                (MockDBMT m) where throw = mockThrow . IFNoParse
 
 
 data SegmentNotFoundEx = SegmentNotFoundEx Segment deriving Show
@@ -384,7 +387,8 @@ data DBConfig m hdl = DBConfig {
         maxReadQueueLen :: Int,
         readQueueShardShift :: Int,
         readerConfig :: ReaderConfig,
-        consumerLimits :: ConsumerLimits
+        consumerLimits :: ConsumerLimits,
+        byteSemantics :: ByteSemantics
     }
 
 defaultDBConfig :: FilePath -> DBConfig IO Handle
@@ -428,6 +432,7 @@ defaultDBConfig rundir = DBConfig{..}
             cutoffCount = 1024,
             cutoffLength = 1024*1024
         }
+    byteSemantics = undefined
 
 
 -- Supports atomic read/write/rename
@@ -513,6 +518,7 @@ mockDBConfig  = DBConfig{..}
             cutoffCount = 8,
             cutoffLength = 256
         }
+    byteSemantics = undefined
 
 
 data DBState m = DBState {
@@ -546,7 +552,7 @@ loadInitSeg run SegmentResource{..} status = case status of
 
 
 
-findRecentRoot :: forall m v . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx] m) => (Segment -> m (Maybe (m ByteString))) -> (ByteString -> m (Maybe v)) -> Segment -> m (Maybe (Ref,v))
+findRecentRoot :: forall m v . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx, NoParse] m) => (Segment -> m (Maybe (m ByteString))) -> (ByteString -> Either NoParse (Maybe v)) -> Segment -> m (Maybe (Ref,v))
 findRecentRoot load isRoot = go
     where
     go strictlyTooHigh 
@@ -558,9 +564,11 @@ findRecentRoot load isRoot = go
             let mmapped = MMapped offs raw
                 findWithin stream = next stream  >>= \case
                     Left () -> return Nothing
-                    Right ((ix,bs),stream') -> isRoot bs >>= \case
-                        Nothing -> findWithin stream'
-                        Just v -> return . Just $ (Ref viable ix, v)
+                    Right ((ix,bs),stream') -> case isRoot bs of
+                        Left noParse -> throw noParse
+                        Right parse -> case parse of
+                            Nothing -> findWithin stream'
+                            Just v -> return . Just $ (Ref viable ix, v)
             findWithin (streamSegFromOffsets Desc mmapped) >>= \case
                 Nothing -> go (pred strictlyTooHigh)
                 Just theRoot -> return $ Just theRoot 
@@ -571,13 +579,13 @@ findRecentRoot load isRoot = go
 -- I was hoping to be able to write setupMock without even using MonadIO, but due
 -- to the structure of dejafu (esp. wrt. exceptions) I was unable to.
 setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
-          Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m, 
+          Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx, NoParse] m, 
           Throws '[SegmentStreamError] n, Writable n) 
       => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> DBConfig m hdl -> m (DBState m)
 setup run hLift DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
-    root <- findRecentRoot (loadSeg segmentResource Finished) undefined initSeg
+    root <- findRecentRoot (loadSeg segmentResource Finished) (semanticIsRoot byteSemantics) initSeg
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
     (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
@@ -734,11 +742,11 @@ data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set R
 spawnGcManager :: (Monad m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
                    Writable n, Throws '[OffsetDecodeEx, GCError] n,
                    RandomGen g)
-               => (forall a . n a -> hdl -> m a) -> ByteSemantics 
+               => (forall a . n a -> hdl -> m a) -> (ByteString -> Either NoParse (VS.Vector Ref)) 
                -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) 
                -> g
                -> m void
-spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = \gen -> forever (readChan completeSegs >>= peristaltize gen)
+spawnGcManager run childrenOf SegmentResource{..} completeSegs registerGC = \gen -> forever (readChan completeSegs >>= peristaltize gen)
     where
     peristaltize gen GcSnapshot{..} | not (null newerRefs) = error "Roots persist from older segments"
                                 -- | null currentIxes =  -- optimization: Just save an empty segment
@@ -747,8 +755,8 @@ spawnGcManager run gcconf SegmentResource{..} completeSegs registerGC = \gen -> 
                                     old_bs <- load
                                     old_offs <- either throw return $ loadOffsets old_bs
                                     let old = MMapped old_offs old_bs
-                                        collect = gc gcconf snapshotSegment currentIxes RootKnown old
-                                    (new_offs, activeRefs, _pers) <- overwriteSeg snapshotSegment (run collect)
+                                        collect = gc childrenOf snapshotSegment currentIxes old
+                                    (new_offs, activeRefs) <- overwriteSeg snapshotSegment (run collect)
                                     new_bs <- load
                                     registerGC snapshotSegment (MMapped new_offs new_bs)
                                     let olderRefs' = union olderRefs activeRefs
@@ -821,18 +829,14 @@ data NoParse = NoParse String deriving Show
 
 
 data ByteSemantics = ByteSemantics {
-    children :: ByteString -> Either NoParse (VS.Vector Ref),
-    isRoot :: ByteString -> Either NoParse Persistence -- NB: Get rid of persistence check. Pass this off to the writer. Writer keeps track of which refs are persistent. Can we do that? How do we ID root on startup?
+    semanticChildren :: ByteString -> Either NoParse (VS.Vector Ref),
+    semanticIsRoot :: ByteString -> Either NoParse (Maybe ()) 
 }
 
 
-data PersistenceStatus = RootKnown
-                       | RootUnknown deriving (Show) -- TODO: Allow keeping lastn roots, or other generalizations
-
 data SegGcState = SegGcState {
     liveHere :: Set Ix,
-    liveThere :: Set Ref,
-    persistenceStatus :: PersistenceStatus
+    liveThere :: Set Ref
 }
 
 
@@ -905,10 +909,10 @@ instance MultiError e m => MultiError e (DummyFileT m) where
     throw = lift . throw
 
 
-gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => ByteSemantics -> Segment -> Set Ix -> PersistenceStatus -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
-gc cfg thisSegment live perst = fmap unwrap . repackFile . gc' cfg thisSegment live perst . streamSegFromOffsets Desc
+gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => (ByteString -> Either NoParse (VS.Vector Ref)) -> Segment -> Set Ix -> MMapped -> m (StoredOffsets, Set Ref)
+gc childrenOf thisSegment live = fmap unwrap . repackFile . gc' childrenOf thisSegment live . streamSegFromOffsets Desc
     where 
-    unwrap (offs :> (live',perst') :> ()) = (offs, live', perst')
+    unwrap (offs :> live' :> ()) = (offs, live')
 
 
 data GCError
@@ -920,24 +924,16 @@ data GCError
     deriving Show
 
 
-gc' :: Throws '[GCError] m => ByteSemantics -> Segment -> Set Ix -> PersistenceStatus -> Stream (Of (Ix, ByteString)) m o -> Stream (Of (Ix, ByteString)) m (Of (Set Ref, PersistenceStatus) o)
-gc' ByteSemantics{..} thisSegment here perst = foldM include (return (SegGcState here Set.empty perst)) (return . finish) . hoist lift
+gc' :: Throws '[GCError] m => (ByteString -> Either NoParse (VS.Vector Ref)) -> Segment -> Set Ix -> Stream (Of (Ix, ByteString)) m o -> Stream (Of (Ix, ByteString)) m (Of (Set Ref) o)
+gc' childrenOf thisSegment here = foldM include (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
     where
-    finish SegGcState{..} = (liveThere, persistenceStatus)
     include state (ix,bs) = do
-        (children, persistence) <- either (lift . throw . GCParseError) return $ inspect bs
-        let normal = if ix `Set.member` (liveHere state) 
-                then do
-                    yield (ix,bs)
-                    includeChildren state ix children
-                else return state
-        case persistence of
-            NormalGC -> normal
-            PersistentRoot -> case persistenceStatus state of
-                 RootKnown -> normal
-                 RootUnknown -> do
-                    yield (ix,bs)
-                    includeChildren (state {persistenceStatus = RootKnown}) ix children
+        children <- either (lift . throw . GCParseError) return $ childrenOf bs
+        if ix `Set.member` (liveHere state) 
+            then do
+                yield (ix,bs)
+                includeChildren state ix children
+            else return state
     includeChildren state thisIx children = VS.foldM' step state children
         where
         step s@SegGcState{..} ref@(Ref seg ix)
