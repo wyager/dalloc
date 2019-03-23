@@ -544,6 +544,29 @@ loadInitSeg run SegmentResource{..} status = case status of
                 () :> _savedOffs <- run (consumeFile @n config fakeWriteQ) hdl
                 return (succ partialSeg)
 
+
+
+findRecentRoot :: forall m v . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx] m) => (Segment -> m (Maybe (m ByteString))) -> (ByteString -> m (Maybe v)) -> Segment -> m (Maybe (Ref,v))
+findRecentRoot load isRoot = go
+    where
+    go strictlyTooHigh 
+        | strictlyTooHigh == minBound = return Nothing -- There is no root anywhere
+        | otherwise = do
+            let viable = pred strictlyTooHigh
+            raw <- load viable >>=  maybe (throw (SegmentNotFoundEx viable)) id 
+            offs <- either throw return $ loadOffsets raw
+            let mmapped = MMapped offs raw
+                findWithin stream = next stream  >>= \case
+                    Left () -> return Nothing
+                    Right ((ix,bs),stream') -> isRoot bs >>= \case
+                        Nothing -> findWithin stream'
+                        Just v -> return . Just $ (Ref viable ix, v)
+            findWithin (streamSegFromOffsets Desc mmapped) >>= \case
+                Nothing -> go (pred strictlyTooHigh)
+                Just theRoot -> return $ Just theRoot 
+
+
+
 -- NB: Setup is completely pure. An instantiation of this function need not use IO.
 -- I was hoping to be able to write setupMock without even using MonadIO, but due
 -- to the structure of dejafu (esp. wrt. exceptions) I was unable to.
@@ -554,6 +577,7 @@ setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m,
 setup run hLift DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
+    root <- findRecentRoot (loadSeg segmentResource Finished) undefined initSeg
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
     (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg segmentResource consumerLimits
@@ -670,6 +694,38 @@ setRange lo hi set = (tooLow, good, tooHigh)
     (tooLow, feasible) = spanAntitone (< lo) set
     (good, tooHigh) = spanAntitone (<= hi) feasible
 
+-- How do we track GC snapshots?
+-- What behavior do we need to guarantee to ensure that there are no reads on GC'd values?
+-- Roots refers to all refs that are extant in RAM (ish)
+-- We should use the ST variable-scope-escape trick
+-- 1. Reads
+-- When a session is opened on a root, we add the root to the live set. (or map - we sort of want to RC active roots)
+-- All reads not created in this session must descend from that root.
+-- Actually, instead of having a separate live set we can just put it in the `Map SeshID (Set Ref)` I suppose. Or can we?
+-- We'll have to pass the Map SeshID (Set Ref) across multiple Writers, I suppose.
+-- 2. Writes
+-- The Writer process keeps a set of all newly created values. Or maybe `Map SeshID (Set Ref)`?
+-- Only one session is entitled to access newly created values (enforced w/ST trick), 
+-- until the session commits (values are tacked onto roots). Figure out an API for that.
+-- When session finishes, it fills an MVar indicating that it has done so.
+-- When the writer flushes a log segment, it figures out which sessions have finished. Dumps those
+-- from the map. Remainder are still live.
+-- How do we persist writes from a session? Maybe it can return a new root ref?
+
+class ReadSesh ref m where
+    read :: ref (a ref) -> m (a ref)
+
+    -- write :: a (ref b)
+
+newtype ReadSeshM m a = 
+    ReadSeshM (
+        
+    )
+data Root
+
+runReadSession :: (forall ref m . ReadSesh ref m => ref Root -> m a) -> ReadSeshM m a
+runReadSession x = undefined
+
 -- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
 -- wrt that segment) and passes it to the GC
 data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set Ref}
@@ -678,7 +734,7 @@ data GcSnapshot = GcSnapshot {snapshotSegment :: Segment, snapshotRoots :: Set R
 spawnGcManager :: (Monad m, MonadConc m, Throws '[StoredOffsetsDecodeEx, GCError] m, 
                    Writable n, Throws '[OffsetDecodeEx, GCError] n,
                    RandomGen g)
-               => (forall a . n a -> hdl -> m a) -> GcConfig ByteString 
+               => (forall a . n a -> hdl -> m a) -> ByteSemantics 
                -> SegmentResource m hdl -> Chan m GcSnapshot -> (Segment -> MMapped -> m ()) 
                -> g
                -> m void
@@ -761,13 +817,17 @@ data Persistence = NormalGC
 
 data NoParse = NoParse String deriving Show
 
-newtype GcConfig entry = GcConfig {
-    inspect :: entry -> Either NoParse (VS.Vector Ref, Persistence)
+
+
+
+data ByteSemantics = ByteSemantics {
+    children :: ByteString -> Either NoParse (VS.Vector Ref),
+    isRoot :: ByteString -> Either NoParse Persistence -- NB: Get rid of persistence check. Pass this off to the writer. Writer keeps track of which refs are persistent. Can we do that? How do we ID root on startup?
 }
 
 
 data PersistenceStatus = RootKnown
-                       | RootUnknown deriving (Show)
+                       | RootUnknown deriving (Show) -- TODO: Allow keeping lastn roots, or other generalizations
 
 data SegGcState = SegGcState {
     liveHere :: Set Ix,
@@ -845,7 +905,7 @@ instance MultiError e m => MultiError e (DummyFileT m) where
     throw = lift . throw
 
 
-gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => GcConfig ByteString -> Segment -> Set Ix -> PersistenceStatus -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
+gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => ByteSemantics -> Segment -> Set Ix -> PersistenceStatus -> MMapped -> m (StoredOffsets, Set Ref, PersistenceStatus)
 gc cfg thisSegment live perst = fmap unwrap . repackFile . gc' cfg thisSegment live perst . streamSegFromOffsets Desc
     where 
     unwrap (offs :> (live',perst') :> ()) = (offs, live', perst')
@@ -860,8 +920,8 @@ data GCError
     deriving Show
 
 
-gc' :: Throws '[GCError] m => GcConfig entry -> Segment -> Set Ix -> PersistenceStatus -> Stream (Of (Ix, entry)) m o -> Stream (Of (Ix, entry)) m (Of (Set Ref, PersistenceStatus) o)
-gc' GcConfig{..} thisSegment here perst = foldM include (return (SegGcState here Set.empty perst)) (return . finish) . hoist lift
+gc' :: Throws '[GCError] m => ByteSemantics -> Segment -> Set Ix -> PersistenceStatus -> Stream (Of (Ix, ByteString)) m o -> Stream (Of (Ix, ByteString)) m (Of (Set Ref, PersistenceStatus) o)
+gc' ByteSemantics{..} thisSegment here perst = foldM include (return (SegGcState here Set.empty perst)) (return . finish) . hoist lift
     where
     finish SegGcState{..} = (liveThere, persistenceStatus)
     include state (ix,bs) = do
@@ -913,7 +973,10 @@ data ConsumerConfig m = ConsumerConfig {
         register :: Map Offset ByteString -> m () -- Should save in "hot" of ReadCache
     }
 
-data ConsumerState flushed = ConsumerState {
+
+data ConsumerState {- seshId seshDone -} flushed = ConsumerState {
+        -- latestRoot :: Ref,
+        -- sessions :: Map seshId (seshDone, Set Ref),
         entries :: Map Offset ByteString,
         writeOffset :: Offset,
         flushQueue :: [flushed]
