@@ -591,19 +591,19 @@ findRecentRoot load isRoot = go
 -- to the structure of dejafu (esp. wrt. exceptions) I was unable to.
 setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
           Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx, NoParse] m, 
-          Throws '[SegmentStreamError] n, Writable n) 
-      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> DBConfig m hdl -> m (DBState m PlainGC)
-setup run hLift DBConfig{..} = do
+          Throws '[SegmentStreamError] n, Writable n,
+          GCModel gc) 
+      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> gc -> DBConfig m hdl -> m (DBState m gc)
+setup run hLift initGC DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
     initRoot <- fmap fst <$> findRecentRoot (loadSeg segmentResource Finished) (semanticIsRoot byteSemantics) initSeg
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
-    let initGC = PlainGC initRoot Map.empty
     (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg initGC segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
-setupIO :: DBConfig IO Handle -> IO (DBState IO PlainGC)
+setupIO :: GCModel gc => gc -> DBConfig IO Handle -> IO (DBState IO gc)
 setupIO = setup run (lift . lift)
     where run write = runHandleT (runBufferT write)
 
@@ -613,8 +613,8 @@ instance Monad m => MonadEvaluate (MockDBMT m) where
 
 -- Introduce MonadIO here only for exception catching that supports DejaFu
 -- (and MonadEvaluate, although we could just put evaluateM = return if we wanted)
-setupMock :: MonadConc m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m) PlainGC)
-setupMock = setup run lift
+setupMock :: (MonadConc m, GCModel gc) => gc -> DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m) gc)
+setupMock = setup run lift 
     where 
     run write hdl = runDummyFileT write (writeToFakeHandle hdl) 
 
@@ -1165,10 +1165,10 @@ demoIO :: IO ()
 demoIO = do
     let cfg = defaultDBConfig "/tmp/rundir"
     putStrLn "Setting up"
-    state <- setupIO cfg
+    state <- setupIO NoGC cfg
     putStrLn "Writing"
     let wq = dbWriter state
-    writes <- flip mapM [0..8*1024] $ \sid -> storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) (SeshID sid, NotRoot)
+    writes <- flip mapM [0..8*1024] $ \sid -> storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) ()
     putStrLn "Waiting"
     refAsyncs <- async $ do
         (refs,flushes) <- unzip <$> mapM wait writes
@@ -1183,12 +1183,12 @@ demoIO = do
 
 -- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
 -- If I can do that without MonadIO, I can get rid of it.
-test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n PlainGC -> n a) -> m (Map FilePath Builder, a)
+test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n NoGC -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
     result <- runMockDBMT throwM fs $ do
-        state <- setupMock cfg
+        state <- setupMock NoGC cfg
         theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)
