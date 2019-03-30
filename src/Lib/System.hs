@@ -106,29 +106,24 @@ data Flushed = Flushed
 
 data IsRoot = YesRoot | NotRoot
 
-data WEnqueued m
-    = SeshInit !(MVar m (SeshID, Maybe Ref))
-    | SeshDone !SeshID
-    | Write !(MVar m Ref) !(MVar m Flushed) !ByteString !SeshID !IsRoot
+data WEnqueued var gc
+    = SeshInit !(var (Initial gc))
+    | SeshDone !(Final gc)
+    | Write !(var Ref) !(var Flushed) !ByteString !(WriteData gc)
     | Tick
 
-coerceEnc :: (MVar n ~ MVar m) => WEnqueued n -> WEnqueued m
-coerceEnc Tick = Tick
-coerceEnc (Write r f b s i) = Write r f b s i
-coerceEnc (SeshDone d) = SeshDone d
-coerceEnc (SeshInit i) = SeshInit i
 
 data MMapped = MMapped !StoredOffsets !ByteString
 
-data WriteQueue m  = WriteQueue (Chan m (WEnqueued m))
+data WriteQueue m gc = WriteQueue (Chan m (WEnqueued (MVar m) gc))
 
 
-streamWriteQ :: MonadConc m => WriteQueue m -> Stream (Of (WEnqueued m)) m void
+streamWriteQ :: MonadConc m => WriteQueue m gc -> Stream (Of (WEnqueued (MVar m) gc)) m void
 streamWriteQ (WriteQueue q) = go
     where
     go = lift (readChan q) >>= yield >> go
 
-newWriteQueue :: MonadConc m => Int -> m (WriteQueue m)
+newWriteQueue :: MonadConc m => Int -> m (WriteQueue m gc)
 newWriteQueue _maxLen = WriteQueue <$> newChan
 
 data REnqueued m = Read !Ref !(MVar m ByteString)
@@ -147,15 +142,15 @@ instance MonadEvaluate IO where
 readQueue :: MonadConc m => Int -> m (ReadQueue m)
 readQueue _maxLen = ReadQueue <$> newChan
 
-storeToQueue :: (MonadConc m, MonadEvaluate m) => WriteQueue m -> ByteString -> SeshID -> IsRoot -> m (Async m (Ref, MVar m Flushed))
-storeToQueue (WriteQueue q) bs seshID isRoot = async $ do
+storeToQueue :: (MonadConc m, MonadEvaluate m) => WriteQueue m gc -> ByteString -> WriteData gc -> m (Async m (Ref, MVar m Flushed))
+storeToQueue (WriteQueue q) bs writeData = async $ do
     saved <- newEmptyMVar
     flushed <- newEmptyMVar
-    writeChan q $ Write saved flushed bs seshID isRoot
+    writeChan q $ Write saved flushed bs writeData
     ref <- takeMVar saved
     return (ref, flushed)
 
-flushWriteQueue :: MonadConc m => WriteQueue m -> m ()
+flushWriteQueue :: MonadConc m => WriteQueue m gc -> m ()
 flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
 
@@ -536,14 +531,14 @@ mockDBConfig  = DBConfig{..}
     byteSemantics = ByteSemantics {..}
 
 
-data DBState m = DBState {
+data DBState m gc = DBState {
     dbReaders :: ReadCache m,
     dbReaderExn :: Async m Void,
-    dbWriter :: WriteQueue m,
+    dbWriter :: WriteQueue m gc,
     dbWriterExn :: Async m Void
 }
 
-dbFinish :: MonadConc m => DBState m -> m Void
+dbFinish :: MonadConc m => DBState m gc -> m Void
 dbFinish DBState{..} = snd <$> waitAny [dbReaderExn, dbWriterExn]
 
 
@@ -558,11 +553,11 @@ loadInitSeg run SegmentResource{..} status = case status of
                     fakeWrite bs = do
                         ref <- newEmptyMVar
                         flushed <- newEmptyMVar
-                        return $ Write ref flushed bs (SeshID 0) NotRoot
+                        return $ Write ref flushed bs ()
                     fakeWriteQ = SP.mapM fakeWrite entries
                     config :: ConsumerConfig n
                     config = ConsumerConfig partialSeg (const (return ()))
-                (_arbitraryRef, _arbitrarySessions) :> _savedOffs <- run (consumeFile @n config Nothing Map.empty fakeWriteQ) hdl
+                _arbitraryGC :> _savedOffs <- run (consumeFile @n config NoGC fakeWriteQ) hdl
                 return (succ partialSeg)
 
 -- consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Maybe Ref -> Map SeshID (Set Ref) -> Stream (Of (WEnqueued m)) m r -> m (Of (Maybe Ref, Map SeshID (Set Ref)) r)
@@ -597,17 +592,18 @@ findRecentRoot load isRoot = go
 setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
           Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx, NoParse] m, 
           Throws '[SegmentStreamError] n, Writable n) 
-      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> DBConfig m hdl -> m (DBState m)
+      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> DBConfig m hdl -> m (DBState m PlainGC)
 setup run hLift DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
     initRoot <- fmap fst <$> findRecentRoot (loadSeg segmentResource Finished) (semanticIsRoot byteSemantics) initSeg
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
-    (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg initRoot Map.empty segmentResource consumerLimits
+    let initGC = PlainGC initRoot Map.empty
+    (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg initGC segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
-setupIO :: DBConfig IO Handle -> IO (DBState IO)
+setupIO :: DBConfig IO Handle -> IO (DBState IO PlainGC)
 setupIO = setup run (lift . lift)
     where run write = runHandleT (runBufferT write)
 
@@ -617,7 +613,7 @@ instance Monad m => MonadEvaluate (MockDBMT m) where
 
 -- Introduce MonadIO here only for exception catching that supports DejaFu
 -- (and MonadEvaluate, although we could just put evaluateM = return if we wanted)
-setupMock :: MonadConc m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m))
+setupMock :: MonadConc m => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m) PlainGC)
 setupMock = setup run lift
     where 
     run write hdl = runDummyFileT write (writeToFakeHandle hdl) 
@@ -674,24 +670,24 @@ readViaReaders ref Readers{..} = do
     return readVar
 
 
-spawnWriter :: forall m n hdl . (MonadConc m, MVar m ~ MVar n, MonadConc n, Writable n) => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> MVar m (Segment, Map Offset ByteString) -> Int -> Segment -> Maybe Ref -> Map SeshID (Set Ref) -> SegmentResource m hdl -> ConsumerLimits -> m (WriteQueue m, Async m Void )
-spawnWriter run liftN hotCache maxWriteQueueLen initSeg initRoot initSessions SegmentResource{..} consumerLimits = do
+spawnWriter :: forall m n hdl gc . (MonadConc m, MVar m ~ MVar n, MonadConc n, Writable n, GCModel gc) => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> MVar m (Segment, Map Offset ByteString) -> Int -> Segment -> gc -> SegmentResource m hdl -> ConsumerLimits -> m (WriteQueue m gc, Async m Void )
+spawnWriter run liftN hotCache maxWriteQueueLen initSeg initGc SegmentResource{..} consumerLimits = do
     writeQ <- newWriteQueue maxWriteQueueLen
     let chunks = hoist lift $ splitWith @m consumerLimits (streamWriteQ writeQ)
-        writeSeg :: Segment -> Maybe Ref -> Map SeshID (Set Ref) -> Stream (Of (WEnqueued m)) m x -> m (Maybe Ref, Map SeshID (Set Ref), x)
-        writeSeg seg latestRoot sessions writes = do
+        writeSeg :: Segment -> gc -> Stream (Of (WEnqueued (MVar m) gc)) m x -> m (gc, x)
+        writeSeg seg gc writes = do
             let registerHotcache :: Map Offset ByteString -> m ()
                 registerHotcache offsets = swapMVar @m hotCache (seg, offsets) >> return ()
-                consumeToHdl = consumeFile @n (ConsumerConfig seg (liftN . registerHotcache)) latestRoot sessions (SP.map coerceEnc $ hoist liftN writes)
-            (latestRoot', sessions') :> r <- writeToSeg seg (run consumeToHdl)
-            return (latestRoot', sessions', r)
-        writeSegS :: Stream (Of (WEnqueued m)) m x -> StateT (Segment, Maybe Ref, Map SeshID (Set Ref)) m x
+                consumeToHdl = consumeFile @n (ConsumerConfig seg (liftN . registerHotcache)) gc (hoist liftN writes)
+            gc' :> r <- writeToSeg seg (run consumeToHdl)
+            return (gc', r)
+        writeSegS :: Stream (Of (WEnqueued (MVar m) gc)) m x -> StateT (Segment, gc) m x
         writeSegS writes = do
-            (seg, root, sessions) <- get
-            (root', sessions', x) <- lift $ writeSeg seg root sessions writes
-            put (succ seg, root', sessions')
+            (seg, gc) <- get
+            (gc', x) <- lift $ writeSeg seg gc writes
+            put (succ seg, gc')
             return x
-    exn <- async $ flip evalStateT (initSeg, initRoot, initSessions) $ mapsM_ writeSegS chunks
+    exn <- async $ flip evalStateT (initSeg, initGc) $ mapsM_ writeSegS chunks
     return (writeQ, exn)
 
 spawnReaders :: (MonadConc m, MonadEvaluate m, Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx] m) 
@@ -825,13 +821,13 @@ splitAfter step initial predicate = go
                 then return (go stream')
                 else segment x' stream'
 
-splitWith :: forall m flushed ref a . Monad m
+splitWith :: forall m flushed ref a gc . Monad m
           => ConsumerLimits 
-          -> Stream (Of (WEnqueued m)) m a 
-          -> Stream (Stream (Of (WEnqueued m)) m) m a
+          -> Stream (Of (WEnqueued (MVar m) gc)) m a 
+          -> Stream (Stream (Of (WEnqueued (MVar m) gc)) m) m a
 splitWith limits = splitAfter throughput (0,0) (`exceeds` limits) 
     where
-    throughput (count,len) (Write _ _ bs _ _) = (count + 1, len `plus` ByteString.length bs)
+    throughput (count,len) (Write _ _ bs _) = (count + 1, len `plus` ByteString.length bs)
     throughput tp          _                  = tp
 
 
@@ -991,13 +987,53 @@ newtype SeshID = SeshID Word64
     deriving (Eq,Ord,Enum)
 
 
-data ConsumerState m = ConsumerState {
-        latestRoot :: Maybe Ref,
-        sessions :: Map SeshID (Set Ref), 
+data ConsumerState gc m = ConsumerState {
+        gcState :: gc,
         entries :: Map Offset ByteString,
         writeOffset :: Offset,
         flushQueue :: [MVar m Flushed]
     }
+
+class GCModel gc where
+    type Initial gc :: * -- The information that a session receives from the GC engine when it starts
+    type Final gc :: * -- The information that a session passes to the GC engine to close the session
+    -- type Snapshot gc :: *  -- The information that the consumer passes to the collector when it's time to GC
+    type WriteData gc :: * -- Metadata accompanying a write request
+    initSession :: gc -> (Initial gc, gc)
+    endSession :: gc -> Final gc -> gc
+    write :: gc -> Ref -> WriteData gc -> gc
+    -- snapshot :: proxy gc -> Serial gc -> Snapshot gc
+
+data PlainGC = PlainGC {
+        _latestRoot :: Maybe Ref,
+        _sessions :: Map SeshID (Set Ref)
+    }
+
+instance GCModel PlainGC where
+    type Initial PlainGC = (SeshID, (Maybe Ref))
+    type Final PlainGC = SeshID
+    type WriteData PlainGC = (SeshID, IsRoot)
+    initSession PlainGC{..} = ((newSeshID, _latestRoot),PlainGC _latestRoot newSessions)
+        where
+        newSeshID = case Map.lookupMax _sessions of
+            Nothing -> SeshID 0
+            Just (seshID,_) -> succ seshID
+        newSessions = Map.insert newSeshID (maybe Set.empty Set.singleton _latestRoot) _sessions
+    endSession PlainGC{..} seshID = PlainGC _latestRoot (Map.delete seshID _sessions)
+    write PlainGC{..} ref (seshID, isRoot) = PlainGC latestRoot' sessions'
+        where
+        latestRoot' = case isRoot of YesRoot -> Just ref; NotRoot -> _latestRoot
+        sessions' = Map.adjust (Set.insert ref) seshID _sessions
+
+data NoGC = NoGC
+
+instance GCModel NoGC where
+    type Initial NoGC = ()
+    type Final NoGC = ()
+    type WriteData NoGC = ()
+    initSession NoGC = ((), NoGC)
+    endSession NoGC () = NoGC
+    write NoGC _ref () = NoGC
 
 
 data SegmentStep = Incomplete | Finalizer ByteString | Packet ByteString ByteString
@@ -1039,46 +1075,41 @@ streamBS = go
             yield packet
             go rest
 
-data ConsumerAction m = Flush [MVar m Flushed] | WriteToLog ByteString (Map Offset ByteString) (MVar m Ref) Ref | Nop | InitSesh (MVar m (SeshID, Maybe Ref)) (SeshID, Maybe Ref)
+data ConsumerAction m gc = Flush [MVar m Flushed] | WriteToLog ByteString (Map Offset ByteString) (MVar m Ref) Ref | Nop | InitSesh (MVar m (Initial gc)) (Initial gc)
 
 
-consume :: Monad m
-        => (ConsumerAction m -> m ()) 
-        -> (ConsumerState m -> m o)
+consume :: (Monad m, GCModel gc) 
+        => (ConsumerAction m gc -> m ()) 
+        -> (ConsumerState gc m -> m o)
         -> Segment
-        -> Maybe Ref 
-        -> Map SeshID (Set Ref)
-        -> Stream (Of (WEnqueued m)) m r -> m (Of o r)
-consume handle finalize thisSeg latestRoot extantSessions = foldM step initial finalize
+        -> gc
+        -> Stream (Of (WEnqueued (MVar m) gc)) m r -> m (Of o r)
+consume handle finalize thisSeg gc = foldM step initial finalize
     where
-    initial = return (ConsumerState latestRoot extantSessions Map.empty (Offset 0) [])
+    initial = return (ConsumerState gc Map.empty (Offset 0) [])
     step state write = do
         let (state', action) = consume' thisSeg state write
         handle action
         return state'
 
 
-consume' :: Segment -> ConsumerState m -> WEnqueued m -> (ConsumerState m, ConsumerAction m)
+consume' :: GCModel gc => Segment -> ConsumerState gc m -> WEnqueued (MVar m) gc -> (ConsumerState gc m, ConsumerAction m gc)
 consume' thisSeg state@ConsumerState{..} = \case
     Tick -> if null flushQueue
         then (state, Nop)
         else (state {flushQueue = []}, Flush flushQueue)
-    Write refVar flushed bs seshID isRoot -> do
+    Write refVar flushed bs gcData -> do
         let entries' = Map.insert writeOffset bs entries
             writeOffset' = writeOffset `plus` (ByteString.length bs + 8)
             ix = Ix (fromIntegral $ length entries)
             ref = Ref thisSeg ix
-            latestRoot' = case isRoot of YesRoot -> Just ref; NotRoot -> latestRoot
-            sessions' = Map.adjust (Set.insert ref) seshID sessions
-        (ConsumerState {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue, latestRoot = latestRoot', sessions = sessions'},
+            gc' = write gcState ref gcData
+        (ConsumerState {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue, gcState = gc'},
             WriteToLog bs entries' refVar ref)
     SeshInit seshRef -> do
-        let newSeshID = case Map.lookupMax sessions of
-                Nothing -> SeshID 0
-                Just (seshID,_) -> succ seshID
-            newSessions = Map.insert newSeshID (maybe Set.empty Set.singleton latestRoot) sessions
-        (state {sessions = newSessions}, InitSesh seshRef (newSeshID, latestRoot))
-    SeshDone seshID -> (state {sessions = Map.delete seshID sessions}, Nop)
+        let (initial, gc') = initSession gcState
+        (state {gcState = gc'}, InitSesh seshRef initial)
+    SeshDone seshID -> (state {gcState = endSession gcState seshID}, Nop)
 
 
 -- data ConsumerState {- seshId seshDone -} m = ConsumerState {
@@ -1090,12 +1121,12 @@ consume' thisSeg state@ConsumerState{..} = \case
 --     }
 
 {-# INLINE consumeFile #-}
-consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Maybe Ref -> Map SeshID (Set Ref) -> Stream (Of (WEnqueued m)) m r -> m (Of (Maybe Ref, Map SeshID (Set Ref)) r)
-consumeFile cfg = consume (saveFile (register cfg)) (\state -> fmap (\() -> (latestRoot state, sessions state)) (finalizeFile cfg state)) (segment cfg)
+consumeFile :: forall m r gc . (MonadConc m, Writable m, GCModel gc) => ConsumerConfig m -> gc -> Stream (Of (WEnqueued (MVar m) gc)) m r -> m (Of gc r)
+consumeFile cfg = consume (saveFile (register cfg)) (\state -> fmap (\() -> gcState state) (finalizeFile cfg state)) (segment cfg)
 
 
 {-# INLINE saveFile #-}
-saveFile :: (MonadConc m, Writable m) => (Map Offset ByteString -> m ()) -> ConsumerAction m -> m ()
+saveFile :: (MonadConc m, Writable m) => (Map Offset ByteString -> m ()) -> ConsumerAction m gc -> m ()
 saveFile registerHotcache action = case action of
         Flush flushed -> do
             flushM
@@ -1122,7 +1153,7 @@ writeOffsetsTo offsets = do
     writeM $ encode offsetsLen
     flushM
 
-finalizeFile :: (MonadConc m, Writable m) => ConsumerConfig m -> ConsumerState m -> m ()
+finalizeFile :: (MonadConc m, Writable m) => ConsumerConfig m -> ConsumerState gc m -> m ()
 finalizeFile ConsumerConfig{..} ConsumerState{..} = do
     flushM
     mapM_ (`putMVar` Flushed) flushQueue
@@ -1137,7 +1168,7 @@ demoIO = do
     state <- setupIO cfg
     putStrLn "Writing"
     let wq = dbWriter state
-    writes <- flip mapM [0..8*1024] $ \sid -> storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) (SeshID sid) NotRoot
+    writes <- flip mapM [0..8*1024] $ \sid -> storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) (SeshID sid, NotRoot)
     putStrLn "Waiting"
     refAsyncs <- async $ do
         (refs,flushes) <- unzip <$> mapM wait writes
@@ -1152,7 +1183,7 @@ demoIO = do
 
 -- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
 -- If I can do that without MonadIO, I can get rid of it.
-test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n -> n a) -> m (Map FilePath Builder, a)
+test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n PlainGC -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
