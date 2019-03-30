@@ -31,7 +31,7 @@ demoMock :: MonadConc m => m (Map FilePath ByteString)
 demoMock = fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ \state -> do
     let wq = dbWriter state
     let rc = dbReaders state
-    writes <- mapM (\c -> storeToQueue wq (ByteString.replicate (20) c) (SeshID 0) NotRoot) $ take 2 [0x44..]
+    writes <- mapM (\c -> storeToQueue wq (ByteString.replicate (20) c) ()) $ take 2 [0x44..]
     refsAsyncs <- async $ unzip <$> mapM wait writes
     (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
     flushWriteQueue wq
@@ -51,7 +51,7 @@ genRandomFilesystem :: forall m g . (MonadConc m, RandomGen g) => DBConfig (Mock
 genRandomFilesystem = \cfg g ->
     fmap fst $ test Map.empty cfg $ \state -> do
         let wq = dbWriter state
-        writes <- mapM (\bs -> storeToQueue wq bs (SeshID 0) NotRoot) $ randomBSs g
+        writes <- mapM (\bs -> storeToQueue wq bs ()) $ randomBSs g
         (_refs, flushes) <- unzip <$> mapM wait writes
         flushWriteQueue wq
         mapM_ takeMVar flushes
@@ -66,12 +66,12 @@ randomBSs g = fst $ Random.withDRG chacha $ mapM Random.getRandomBytes lens
     chacha = Random.drgNewTest (seed, 0, 0, 0, 0)
 
 
-readEqualsWrite :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBState m -> m Bool
+readEqualsWrite :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBState m NoGC -> m Bool
 readEqualsWrite g state = do
     let wq = dbWriter state
     let rc = dbReaders state
     let byteStrings = randomBSs g
-    writes <- mapM (\bs -> storeToQueue wq bs (SeshID 0) NotRoot) byteStrings
+    writes <- mapM (\bs -> storeToQueue wq bs ()) byteStrings
     refsAsyncs <- async $ unzip <$> mapM wait writes
     (_, (refs, flushes)) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
     readAll1 <- mapM (`readViaReadCache` rc) refs 

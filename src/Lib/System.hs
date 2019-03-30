@@ -154,10 +154,6 @@ storeToQueue (WriteQueue q) bs writeData = async $ do
 flushWriteQueue :: MonadConc m => WriteQueue m gc -> m ()
 flushWriteQueue (WriteQueue q) = writeChan q $ Tick
 
-
-
--- -- data SegCache = SegCache StoredOffsets (LruCache Ix ByteString)
-
 data ReaderConfig = ReaderConfig {
         lruSize     :: Int,
         maxOpenSegs :: Int
@@ -563,9 +559,9 @@ loadInitSeg run SegmentResource{..} status = case status of
 
 -- consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Maybe Ref -> Map SeshID (Set Ref) -> Stream (Of (WEnqueued m)) m r -> m (Of (Maybe Ref, Map SeshID (Set Ref)) r)
 
-
-findRecentRoot :: forall m gc . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx, NoParse] m, GCModel gc) => (Segment -> m (Maybe (m ByteString))) -> Segment -> m gc
-findRecentRoot load seg = f (initializer @gc)
+-- Scans backwards through the latest segments, to set up the GC as needed.
+initializeGC :: forall m gc . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx, NoParse] m, GCModel gc) => (Segment -> m (Maybe (m ByteString))) -> Segment -> m gc
+initializeGC load seg = f (initializer @gc)
         where
         f (Initializer s0 step finish) = go s0 seg
             where
@@ -597,7 +593,7 @@ setup :: forall m n hdl gc . (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEv
 setup run hLift DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
-    initGC <- findRecentRoot (loadSeg segmentResource Finished) initSeg :: m gc
+    initGC <- initializeGC (loadSeg segmentResource Finished) initSeg :: m gc
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
     (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg initGC segmentResource consumerLimits
