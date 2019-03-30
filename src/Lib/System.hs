@@ -28,7 +28,7 @@ import           GHC.Generics (Generic)
 import           Foreign.Ptr (Ptr, plusPtr, castPtr)
 import           Foreign.Storable (Storable, peek, poke, sizeOf, alignment)
 import           Streaming.Prelude (Stream, yield, foldM, next)
-import qualified Streaming.Prelude as SP (mapM, map)
+import qualified Streaming.Prelude as SP (mapM)
 import           Streaming (wrap, mapsM_)
 import           Data.Functor.Of (Of((:>)))
 import           Control.Monad.Trans.Class (lift)
@@ -46,6 +46,7 @@ import           Control.Monad.Catch (MonadThrow, MonadCatch, MonadMask, throwM)
 import           Numeric.Search.Range (searchFromTo)
 import           System.Random (RandomGen, randomR)
 import           Data.Tuple (swap)
+import           Data.Proxy (Proxy(Proxy))
 -- import           Data.Coerce (coerce)
 
 newtype Segment = Segment Word64
@@ -563,47 +564,46 @@ loadInitSeg run SegmentResource{..} status = case status of
 -- consumeFile :: forall m r . (MonadConc m, Writable m) => ConsumerConfig m -> Maybe Ref -> Map SeshID (Set Ref) -> Stream (Of (WEnqueued m)) m r -> m (Of (Maybe Ref, Map SeshID (Set Ref)) r)
 
 
-findRecentRoot :: forall m v . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx, NoParse] m) => (Segment -> m (Maybe (m ByteString))) -> (ByteString -> Either NoParse (Maybe v)) -> Segment -> m (Maybe (Ref,v))
-findRecentRoot load isRoot = go
-    where
-    go strictlyTooHigh 
-        | strictlyTooHigh == minBound = return Nothing -- There is no root anywhere
-        | otherwise = do
-            let viable = pred strictlyTooHigh
-            raw <- load viable >>=  maybe (throw (SegmentNotFoundEx viable)) id 
-            offs <- either throw return $ loadOffsets raw
-            let mmapped = MMapped offs raw
-                findWithin stream = next stream  >>= \case
-                    Left () -> return Nothing
-                    Right ((ix,bs),stream') -> case isRoot bs of
-                        Left noParse -> throw noParse
-                        Right parse -> case parse of
-                            Nothing -> findWithin stream'
-                            Just v -> return . Just $ (Ref viable ix, v)
-            findWithin (streamSegFromOffsets Desc mmapped) >>= \case
-                Nothing -> go (pred strictlyTooHigh)
-                Just theRoot -> return $ Just theRoot 
+findRecentRoot :: forall m gc . (Monad m, Throws '[SegmentNotFoundEx, OffsetDecodeEx, StoredOffsetsDecodeEx, NoParse] m, GCModel gc) => (Segment -> m (Maybe (m ByteString))) -> Segment -> m gc
+findRecentRoot load seg = f (initializer @gc)
+        where
+        f (Initializer s0 step finish) = go s0 seg
+            where
+            go gcInit strictlyTooHigh 
+                | strictlyTooHigh == minBound = either throw return $ finish gcInit
+                | otherwise = do
+                    let viable = pred strictlyTooHigh
+                    raw <- load viable >>=  maybe (throw (SegmentNotFoundEx viable)) id 
+                    offs <- either throw return $ loadOffsets raw
+                    let mmapped = MMapped offs raw
+                        findWithin state stream = next stream  >>= \case
+                            Left () -> go state (pred strictlyTooHigh)
+                            Right ((ix,bs),stream') -> case step state (Ref viable ix) bs of
+                                Left (Left noParse) -> throw noParse
+                                Left (Right done) -> return done
+                                Right continue -> findWithin continue stream'
+                    findWithin gcInit (streamSegFromOffsets Desc mmapped) 
 
 
 
 -- NB: Setup is completely pure. An instantiation of this function need not use IO.
 -- I was hoping to be able to write setupMock without even using MonadIO, but due
 -- to the structure of dejafu (esp. wrt. exceptions) I was unable to.
-setup :: (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
+setup :: forall m n hdl gc . (MVar m ~ MVar n, MonadConc m, MonadConc n, MonadEvaluate m, 
           Throws '[IndexError, CacheConsistencyError, OffsetDecodeEx, ReaderConsistencyError, StoredOffsetsDecodeEx, SegmentNotFoundEx, NoParse] m, 
           Throws '[SegmentStreamError] n, Writable n,
           GCModel gc) 
-      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a) -> gc -> DBConfig m hdl -> m (DBState m gc)
-setup run hLift initGC DBConfig{..} = do
+      => (forall a . n a -> hdl -> m a) -> (forall a . m a -> n a)  -> DBConfig m hdl -> m (DBState m gc)
+setup run hLift DBConfig{..} = do
     status <- initialize' (loadSeg segmentResource)
     initSeg <- loadInitSeg run segmentResource status
-    initRoot <- fmap fst <$> findRecentRoot (loadSeg segmentResource Finished) (semanticIsRoot byteSemantics) initSeg
+    initGC <- findRecentRoot (loadSeg segmentResource Finished) initSeg :: m gc
     (readers, readersExn) <- spawnReaders maxReadQueueLen readQueueShardShift (loadSeg segmentResource Finished) readerConfig
     hotCache <- newMVar (initSeg, mempty)
     (writer, writerExn) <- spawnWriter run hLift hotCache maxWriteQueueLen initSeg initGC segmentResource consumerLimits
     return $ DBState (ReadCache readers hotCache) readersExn writer writerExn
 
-setupIO :: GCModel gc => gc -> DBConfig IO Handle -> IO (DBState IO gc)
+setupIO :: forall gc .  GCModel gc => DBConfig IO Handle -> IO (DBState IO gc)
 setupIO = setup run (lift . lift)
     where run write = runHandleT (runBufferT write)
 
@@ -613,7 +613,7 @@ instance Monad m => MonadEvaluate (MockDBMT m) where
 
 -- Introduce MonadIO here only for exception catching that supports DejaFu
 -- (and MonadEvaluate, although we could just put evaluateM = return if we wanted)
-setupMock :: (MonadConc m, GCModel gc) => gc -> DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m) gc)
+setupMock :: forall gc m . (MonadConc m, GCModel gc) => DBConfig (MockDBMT m) FakeHandle -> MockDBMT m (DBState (MockDBMT m) gc)
 setupMock = setup run lift 
     where 
     run write hdl = runDummyFileT write (writeToFakeHandle hdl) 
@@ -733,19 +733,19 @@ setRange lo hi set = (tooLow, good, tooHigh)
 -- from the map. Remainder are still live.
 -- How do we persist writes from a session? Maybe it can return a new root ref?
 
-class ReadSesh ref m where
-    read :: ref (a ref) -> m (a ref)
+-- class ReadSesh ref m where
+--     read :: ref (a ref) -> m (a ref)
 
-    -- write :: a (ref b)
+--     -- write :: a (ref b)
 
-newtype ReadSeshM m a = 
-    ReadSeshM (
+-- newtype ReadSeshM m a = 
+--     ReadSeshM (
         
-    )
-data Root
+--     )
+-- data Root
 
-runReadSession :: (forall ref m . ReadSesh ref m => ref Root -> m a) -> ReadSeshM m a
-runReadSession x = undefined
+-- runReadSession :: (forall ref m . ReadSesh ref m => ref Root -> m a) -> ReadSeshM m a
+-- runReadSession x = undefined
 
 -- Whenever the writer finishes a segment, it takes a snapshot of all active roots (which can only shrink
 -- wrt that segment) and passes it to the GC
@@ -768,7 +768,7 @@ spawnGcManager run childrenOf SegmentResource{..} completeSegs registerGC = \gen
                                     old_bs <- load
                                     old_offs <- either throw return $ loadOffsets old_bs
                                     let old = MMapped old_offs old_bs
-                                        collect = gc childrenOf snapshotSegment currentIxes old
+                                        collect = gcOneSegment childrenOf snapshotSegment currentIxes old
                                     (new_offs, activeRefs) <- overwriteSeg snapshotSegment (run collect)
                                     new_bs <- load
                                     registerGC snapshotSegment (MMapped new_offs new_bs)
@@ -821,7 +821,7 @@ splitAfter step initial predicate = go
                 then return (go stream')
                 else segment x' stream'
 
-splitWith :: forall m flushed ref a gc . Monad m
+splitWith :: forall m a gc . Monad m
           => ConsumerLimits 
           -> Stream (Of (WEnqueued (MVar m) gc)) m a 
           -> Stream (Stream (Of (WEnqueued (MVar m) gc)) m) m a
@@ -921,13 +921,6 @@ runDummyFileT (DummyFileT reader) = runReaderT reader
 instance MultiError e m => MultiError e (DummyFileT m) where
     throw = lift . throw
 
-
-gc :: (Throws '[GCError, OffsetDecodeEx] m, Writable m) => (ByteString -> Either NoParse (VS.Vector Ref)) -> Segment -> Set Ix -> MMapped -> m (StoredOffsets, Set Ref)
-gc childrenOf thisSegment live = fmap unwrap . repackFile . gc' childrenOf thisSegment live . streamSegFromOffsets Desc
-    where 
-    unwrap (offs :> live' :> ()) = (offs, live')
-
-
 data GCError
     = GCDeserializeError 
     | SegmentCausalityViolation Segment Ref 
@@ -936,24 +929,27 @@ data GCError
     | GCSegmentLoadError Segment
     deriving Show
 
-
-gc' :: Throws '[GCError] m => (ByteString -> Either NoParse (VS.Vector Ref)) -> Segment -> Set Ix -> Stream (Of (Ix, ByteString)) m o -> Stream (Of (Ix, ByteString)) m (Of (Set Ref) o)
-gc' childrenOf thisSegment here = foldM include (return (SegGcState here Set.empty)) (return . liveThere) . hoist lift
-    where
-    include state (ix,bs) = do
-        children <- either (lift . throw . GCParseError) return $ childrenOf bs
-        if ix `Set.member` (liveHere state) 
-            then do
-                yield (ix,bs)
-                includeChildren state ix children
-            else return state
-    includeChildren state thisIx children = VS.foldM' step state children
+gcOneSegment :: forall m . (Throws '[GCError, OffsetDecodeEx] m, Writable m) => (ByteString -> Either NoParse (VS.Vector Ref)) -> Segment -> Set Ix -> MMapped -> m (StoredOffsets, Set Ref)
+gcOneSegment childrenOf thisSegment live = fmap unwrap . repackFile . gc' . streamSegFromOffsets Desc
+    where 
+    unwrap (offs :> live' :> ()) = (offs, live')
+    gc' :: forall o . Throws '[GCError] m => Stream (Of (Ix, ByteString)) m o -> Stream (Of (Ix, ByteString)) m (Of (Set Ref) o)
+    gc' = foldM include (return (SegGcState live Set.empty)) (return . liveThere) . hoist lift
         where
-        step s@SegGcState{..} ref@(Ref seg ix)
-            | seg > thisSegment = lift $ throw $ SegmentCausalityViolation thisSegment ref 
-            | seg == thisSegment && ix >= thisIx = lift $ throw $ IndexCausalityViolation thisIx ref 
-            | seg == thisSegment = return $  s {liveHere = Set.insert ix liveHere}
-            | otherwise = return $ s {liveThere = Set.insert ref liveThere}
+        include state (ix,bs) = do
+            children <- either (lift . throw . GCParseError) return $ childrenOf bs
+            if ix `Set.member` (liveHere state) 
+                then do
+                    yield (ix,bs)
+                    includeChildren state ix children
+                else return state
+        includeChildren state thisIx children = VS.foldM' step state children
+            where
+            step s@SegGcState{..} ref@(Ref seg ix)
+                | seg > thisSegment = lift $ throw $ SegmentCausalityViolation thisSegment ref 
+                | seg == thisSegment && ix >= thisIx = lift $ throw $ IndexCausalityViolation thisIx ref 
+                | seg == thisSegment = return $  s {liveHere = Set.insert ix liveHere}
+                | otherwise = return $ s {liveThere = Set.insert ref liveThere}
 
 
 data RepackState = RepackState {
@@ -994,6 +990,14 @@ data ConsumerState gc m = ConsumerState {
         flushQueue :: [MVar m Flushed]
     }
 
+data Initializer result where
+    Initializer :: x -> (x -> Ref -> ByteString -> Either r x) -> (x -> r) -> Initializer r
+    {-             ^    ^                                    ^    ^
+                   |    '------------------------------------'    '-nothing left, finish up
+                   |             check if this is a root
+                   initial state
+   -}
+
 class GCModel gc where
     type Initial gc :: * -- The information that a session receives from the GC engine when it starts
     type Final gc :: * -- The information that a session passes to the GC engine to close the session
@@ -1001,29 +1005,35 @@ class GCModel gc where
     type WriteData gc :: * -- Metadata accompanying a write request
     initSession :: gc -> (Initial gc, gc)
     endSession :: gc -> Final gc -> gc
-    write :: gc -> Ref -> WriteData gc -> gc
+    registerWrite :: gc -> Ref -> WriteData gc -> gc
+    initializer :: Initializer (Either NoParse gc)
     -- snapshot :: proxy gc -> Serial gc -> Snapshot gc
 
-data PlainGC = PlainGC {
-        _latestRoot :: Maybe Ref,
-        _sessions :: Map SeshID (Set Ref)
+data PlainGC semantics = PlainGC {
+        latestRoot :: Maybe Ref,
+        sessions :: Map SeshID (Set Ref)
     }
 
-instance GCModel PlainGC where
-    type Initial PlainGC = (SeshID, (Maybe Ref))
-    type Final PlainGC = SeshID
-    type WriteData PlainGC = (SeshID, IsRoot)
-    initSession PlainGC{..} = ((newSeshID, _latestRoot),PlainGC _latestRoot newSessions)
+instance ByteSemantics' semantics => GCModel (PlainGC semantics) where
+    type Initial   (PlainGC semantics) = (SeshID, (Maybe Ref))
+    type Final     (PlainGC semantics) = SeshID
+    type WriteData (PlainGC semantics) = (SeshID, IsRoot)
+    initSession PlainGC{..} = ((newSeshID, latestRoot),PlainGC latestRoot newSessions)
         where
-        newSeshID = case Map.lookupMax _sessions of
+        newSeshID = case Map.lookupMax sessions of
             Nothing -> SeshID 0
             Just (seshID,_) -> succ seshID
-        newSessions = Map.insert newSeshID (maybe Set.empty Set.singleton _latestRoot) _sessions
-    endSession PlainGC{..} seshID = PlainGC _latestRoot (Map.delete seshID _sessions)
-    write PlainGC{..} ref (seshID, isRoot) = PlainGC latestRoot' sessions'
+        newSessions = Map.insert newSeshID (maybe Set.empty Set.singleton latestRoot) sessions
+    endSession PlainGC{..} seshID = PlainGC latestRoot (Map.delete seshID sessions)
+    registerWrite PlainGC{..} ref (seshID, isRoot) = PlainGC latestRoot' sessions'
         where
-        latestRoot' = case isRoot of YesRoot -> Just ref; NotRoot -> _latestRoot
-        sessions' = Map.adjust (Set.insert ref) seshID _sessions
+        latestRoot' = case isRoot of YesRoot -> Just ref; NotRoot -> latestRoot
+        sessions' = Map.adjust (Set.insert ref) seshID sessions
+    initializer = Initializer () (\() ref bs -> case semanticIsRoot' (Proxy @semantics) bs of
+                                                    Left noParse -> Left $ Left noParse
+                                                    Right YesRoot -> Left $ Right $ PlainGC (Just ref) Map.empty
+                                                    Right NotRoot -> Right ())
+                                 (\() -> Right $ PlainGC Nothing Map.empty)
 
 data NoGC = NoGC
 
@@ -1033,12 +1043,16 @@ instance GCModel NoGC where
     type WriteData NoGC = ()
     initSession NoGC = ((), NoGC)
     endSession NoGC () = NoGC
-    write NoGC _ref () = NoGC
+    registerWrite NoGC _ref () = NoGC
+    initializer = Initializer () (\() _ -> const (Left $ Right NoGC)) (const $ Right NoGC)
 
 
 data SegmentStep = Incomplete | Finalizer ByteString | Packet ByteString ByteString
 
 
+class ByteSemantics' sem where
+    semanticIsRoot' :: proxy sem -> ByteString -> Either NoParse IsRoot
+    semanticChildren' :: proxy sem -> ByteString -> Either NoParse (VS.Vector Ref)
 
 
 segmentStep :: ByteString -> SegmentStep
@@ -1103,7 +1117,7 @@ consume' thisSeg state@ConsumerState{..} = \case
             writeOffset' = writeOffset `plus` (ByteString.length bs + 8)
             ix = Ix (fromIntegral $ length entries)
             ref = Ref thisSeg ix
-            gc' = write gcState ref gcData
+            gc' = registerWrite gcState ref gcData
         (ConsumerState {entries = entries', writeOffset = writeOffset', flushQueue = flushed : flushQueue, gcState = gc'},
             WriteToLog bs entries' refVar ref)
     SeshInit seshRef -> do
@@ -1165,10 +1179,10 @@ demoIO :: IO ()
 demoIO = do
     let cfg = defaultDBConfig "/tmp/rundir"
     putStrLn "Setting up"
-    state <- setupIO NoGC cfg
+    state <- setupIO @NoGC cfg 
     putStrLn "Writing"
     let wq = dbWriter state
-    writes <- flip mapM [0..8*1024] $ \sid -> storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) ()
+    writes <- replicateM (8*1024) $ storeToQueue wq (ByteString.replicate (16 {- *4096 -}) 0x44) ()
     putStrLn "Waiting"
     refAsyncs <- async $ do
         (refs,flushes) <- unzip <$> mapM wait writes
@@ -1188,7 +1202,7 @@ test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
     result <- runMockDBMT throwM fs $ do
-        state <- setupMock NoGC cfg
+        state <- setupMock @NoGC cfg 
         theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)

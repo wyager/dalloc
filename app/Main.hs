@@ -2,9 +2,9 @@ module Main (main) where
 
 import Lib.System (demoIO)
 
-import Test.DejaFu (autocheck)
+-- import Test.DejaFu (autocheck)
 
-import Control.Monad (replicateM)
+-- import Control.Monad (replicateM)
 
 main :: IO ()
 main = demoIO --  autocheck demoMock >>= print
