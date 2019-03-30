@@ -1122,14 +1122,6 @@ consume' thisSeg state@ConsumerState{..} = \case
     SeshDone seshID -> (state {gcState = endSession gcState seshID}, Nop)
 
 
--- data ConsumerState {- seshId seshDone -} m = ConsumerState {
---         latestRoot :: Ref,
---         sessions :: Map SeshID (Set Ref), 
---         entries :: Map Offset ByteString,
---         writeOffset :: Offset,
---         flushQueue :: [MVar m Flushed]
---     }
-
 {-# INLINE consumeFile #-}
 consumeFile :: forall m r gc . (MonadConc m, Writable m, GCModel gc) => ConsumerConfig m -> gc -> Stream (Of (WEnqueued (MVar m) gc)) m r -> m (Of gc r)
 consumeFile cfg = consume (saveFile (register cfg)) (\state -> fmap (\() -> gcState state) (finalizeFile cfg state)) (segment cfg)
