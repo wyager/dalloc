@@ -390,8 +390,7 @@ data DBConfig m hdl = DBConfig {
         maxReadQueueLen :: Int,
         readQueueShardShift :: Int,
         readerConfig :: ReaderConfig,
-        consumerLimits :: ConsumerLimits,
-        byteSemantics :: ByteSemantics
+        consumerLimits :: ConsumerLimits
     }
 
 defaultDBConfig :: FilePath -> DBConfig IO Handle
@@ -435,10 +434,6 @@ defaultDBConfig rundir = DBConfig{..}
             cutoffCount = 1024,
             cutoffLength = 1024*1024
         }
-    semanticChildren _ = Right VS.empty
-    semanticIsRoot _ = Right Nothing
-    byteSemantics = ByteSemantics{..}
-
 
 -- Supports atomic read/write/rename
 newtype FakeFilesystem m = FakeFilesystem (forall b . (Map FilePath Builder -> (Map FilePath Builder,b)) -> m b)
@@ -523,9 +518,6 @@ mockDBConfig  = DBConfig{..}
             cutoffCount = 8,
             cutoffLength = 256
         }
-    semanticChildren _ = Right VS.empty
-    semanticIsRoot _ = Right Nothing
-    byteSemantics = ByteSemantics {..}
 
 
 data DBState m gc = DBState {
@@ -837,12 +829,6 @@ data NoParse = NoParse String deriving Show
 
 
 
-data ByteSemantics = ByteSemantics {
-    semanticChildren :: ByteString -> Either NoParse (VS.Vector Ref),
-    semanticIsRoot :: ByteString -> Either NoParse (Maybe ()) 
-}
-
-
 data SegGcState = SegGcState {
     liveHere :: Set Ix,
     liveThere :: Set Ref
@@ -1010,7 +996,7 @@ data PlainGC semantics = PlainGC {
         sessions :: Map SeshID (Set Ref)
     }
 
-instance ByteSemantics' semantics => GCModel (PlainGC semantics) where
+instance ByteSemantics semantics => GCModel (PlainGC semantics) where
     type Initial   (PlainGC semantics) = (SeshID, (Maybe Ref))
     type Final     (PlainGC semantics) = SeshID
     type WriteData (PlainGC semantics) = (SeshID, IsRoot)
@@ -1025,7 +1011,7 @@ instance ByteSemantics' semantics => GCModel (PlainGC semantics) where
         where
         latestRoot' = case isRoot of YesRoot -> Just ref; NotRoot -> latestRoot
         sessions' = Map.adjust (Set.insert ref) seshID sessions
-    initializer = Initializer () (\() ref bs -> case semanticIsRoot' (Proxy @semantics) bs of
+    initializer = Initializer () (\() ref bs -> case semanticIsRoot (Proxy @semantics) bs of
                                                     Left noParse -> Left $ Left noParse
                                                     Right YesRoot -> Left $ Right $ PlainGC (Just ref) Map.empty
                                                     Right NotRoot -> Right ())
@@ -1046,9 +1032,13 @@ instance GCModel NoGC where
 data SegmentStep = Incomplete | Finalizer ByteString | Packet ByteString ByteString
 
 
-class ByteSemantics' sem where
-    semanticIsRoot' :: proxy sem -> ByteString -> Either NoParse IsRoot
-    semanticChildren' :: proxy sem -> ByteString -> Either NoParse (VS.Vector Ref)
+class ByteSemantics sem where
+    semanticIsRoot :: proxy sem -> ByteString -> Either NoParse IsRoot
+    semanticChildren :: proxy sem -> ByteString -> Either NoParse (VS.Vector Ref)
+
+
+
+-- instance ByteSemantics Root where
 
 
 segmentStep :: ByteString -> SegmentStep
