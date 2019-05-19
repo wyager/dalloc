@@ -7,6 +7,8 @@ import Data.Functor.Compose (Compose(..))
 import qualified Control.Monad.State.Strict as State
 import Control.Monad.Identity (Identity, runIdentity)
 import Control.Monad.Trans.Identity (runIdentityT)
+import Control.Monad.Trans.Class (lift)
+import Control.Monad.Trans.Compose (ComposeT(..))
 
 
 
@@ -53,3 +55,6 @@ testI n = Prelude.print $ runIdentity $ StP.length $ streamBST $ hugeI n
 
 test2I :: Int -> IO ()
 test2I n = Prelude.print $ runIdentity $ runIdentityT $ unstack (foldML' 0 (\acc _ -> return ((1 :: Int) + acc))) $ hugeI n
+
+-- streamBST2 :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
+-- streamBST2 bt = Sch.runMFoldR (getComposeT $ Sch.unstack2 Sch.foldMR2' bt) (\a () -> StP.yield a) ()
