@@ -51,6 +51,7 @@ default-extensions:
 - FunctionalDependencies
 - ConstraintKinds
 - DeriveTraversable
+- BangPatterns
 
 dependencies:
 - base >= 4.7 && < 5

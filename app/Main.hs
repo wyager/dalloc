@@ -1,13 +1,17 @@
 module Main (main) where
 
-import Lib.System (demoIO)
+import qualified Lib.SchemeTest as ST
+
+main = ST.test2S 20
+
+-- import Lib.System (demoIO)
 
 -- import Test.DejaFu (autocheck)
 
 -- import Control.Monad (replicateM)
 
-main :: IO ()
-main = demoIO --  autocheck demoMock >>= print
+-- main :: IO ()
+-- main = demoIO --  autocheck demoMock >>= print
 
 -- import           Control.Concurrent.MVar (MVar, newEmptyMVar, takeMVar, putMVar)
 -- import           Control.Concurrent.STM.TMVar (TMVar, newEmptyTMVarIO, takeTMVar, putTMVar)
