@@ -1,6 +1,7 @@
 module Lib.Schemes where
 
 import Control.Monad.Trans.Class (MonadTrans, lift)
+import Control.Monad.Reader.Class (MonadReader, ask, local)
 import Data.Fix (Fix(..))
 import Data.Functor.Compose (Compose(..))
 import Control.Monad.Trans.Identity (IdentityT(..))
@@ -73,8 +74,17 @@ test = runIdentityT $ mList (n_ 5 (n_ 1 l_ l_) (n_ 7 l_ l_))
 -- recursive data structure (z) rather than one argument for each argument in the recursive function.
 -- However, streamBST2 is giving me trouble by requiring an MFunctor instance
 
-newtype MFoldR a b (m :: * -> *) r = MFoldR {runMFoldR :: (a -> b -> m b) -> b -> m r }
-    deriving (Functor, Applicative, Monad) via ReaderT (a -> b -> m b) (ReaderT b m) 
+newtype MFoldR a b t (m :: * -> *) r = MFoldR {runMFoldR :: (a -> b -> t m b) -> b -> t m r }
+    deriving (Functor, Applicative, Monad) via ReaderT (a -> b -> t m b) (ReaderT b (t m)) 
+
+instance MonadTrans t => MonadTrans (MFoldR a b t) where
+    lift m = MFoldR $ \ _ _ -> lift m
+
+newtype MFoldL a b t (m :: * -> *) r = MFoldL {runMFoldL :: (b -> a -> t m b) -> b -> t m r }
+    deriving (Functor, Applicative, Monad) via ReaderT (b -> a -> t m b) (ReaderT b (t m)) 
+
+instance MonadTrans t => MonadTrans (MFoldL a b t) where
+    lift m = MFoldL $ \ _ _ -> lift m
 
 -- instance MFunctor (MFoldR a b) where
 --     hoist f (MFoldR g) = MFoldR $ \step base -> let step' = \a b -> f (step a b) in g step' base
@@ -84,25 +94,42 @@ foldMR2 :: forall a b t . ()
            => (forall m . Monad m => Monad (t m)) 
            => MonadTrans t
            => forall m . Monad m 
-           => forall z . (z -> MFoldR a b (t m) b)
+           => forall z . (z -> MFoldR a b t m b)
            -> BT a z
-           -> MFoldR a b (t m) b
+           -> MFoldR a b t m b
 foldMR2 rec g = MFoldR $ \f b0 -> case g of
         N a gl gr-> do
-            br <- runMFoldR (rec gl) f b0
+            br <- runMFoldR (rec gr) f b0
             bm <- f a br
-            bl <- runMFoldR (rec gr) f bm
+            bl <- runMFoldR (rec gl) f bm
             return bl
         L -> return b0
 
-foldMR2' :: forall a b t . () 
+
+
+foldML2' :: forall a b t . () 
            => (forall m . Monad m => Monad (t m)) 
            => MonadTrans t
            => forall m . Monad m 
-           => forall z . (z -> ComposeT (MFoldR a b) t m b)
+           => forall z . (z -> MFoldL a b t m b)
            -> BT a z
-           -> ComposeT (MFoldR a b) t m b
-foldMR2' rec g = let rec' = getComposeT . rec in ComposeT (foldMR2 rec' g)
+           -> MFoldL a b t m b
+foldML2' rec g = MFoldL $ \f b0 -> case g of
+        N a gl gr-> do
+            !bl <- runMFoldL (rec gl) f b0
+            !bm <- f bl a
+            !br <- runMFoldL (rec gr) f bm
+            return br
+        L -> return b0
+
+-- foldMR2' :: forall a b t . () 
+--            => (forall m . Monad m => Monad (t m)) 
+--            => MonadTrans t
+--            => forall m . Monad m 
+--            => forall z . (z -> ComposeT (MFoldR a b) t m b)
+--            -> BT a z
+--            -> ComposeT (MFoldR a b) t m b
+-- foldMR2' rec g = let rec' = getComposeT . rec in ComposeT (foldMR2 rec' g)
 
 unstack2 :: forall a g t m . ()
         => Monad m 
@@ -113,12 +140,13 @@ unstack2 :: forall a g t m . ()
 unstack2 f = go
     where
     go :: Fix (Compose m g) -> t m a
-    go  = f go <=< lift . getCompose . unFix
+    go = f go <=< lift . getCompose . unFix 
+
+        
 
 
-
-
-
+-- x :: (Monad m, MonadTrans t, forall n . Monad n => Monad (t n)) => Fix (Compose m (BT a)) -> (a -> b -> t m b) -> b -> t m b
+-- x = runMFoldR . unstack2 foldMR2 
 
 
 

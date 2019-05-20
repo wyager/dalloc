@@ -2,7 +2,7 @@ module Main (main) where
 
 import qualified Lib.SchemeTest as ST
 
-main = ST.test2S 20
+main = ST.test4 20
 
 -- import Lib.System (demoIO)
 
