@@ -7,14 +7,11 @@ import Data.Functor.Compose (Compose(..))
 import qualified Control.Monad.State.Strict as State
 import Control.Monad.Identity (Identity, runIdentity)
 import Control.Monad.Trans.Identity (runIdentityT)
-import Control.Monad.Trans.Class (lift)
-import Control.Monad.Trans.Compose (ComposeT(..))
-import Control.Monad.Trans.Identity (IdentityT(..))
 
-
+-- TODO: Get the args in the right order for foldr/foldl
 
 streamBST :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
-streamBST = Sch.unstack (foldMR () (\a () -> StP.yield a)) 
+streamBST bt = rfoldr bt (\a () -> StP.yield a) ()
 
 huge :: Int -> Fix (Compose IO (BT Int))
 huge depth = go 0 1
@@ -49,31 +46,15 @@ testS n = Prelude.print $ flip State.runState 0 $ StP.length $ streamBST $ hugeS
 
 
 test2S :: Int -> IO ()
-test2S n = Prelude.print $ flip State.runState 0 $ runIdentityT $ unstack (foldML' 0 (\acc x -> return (x + acc))) $ hugeS n
+test2S n = Prelude.print $ flip State.runState 0 $ runIdentityT $ (rfoldl' ( hugeS n)  (\acc x -> return (x + acc)) 0)
 
 testI :: Int -> IO ()
 testI n = Prelude.print $ runIdentity $ StP.length $ streamBST $ hugeI n
 
 test2I :: Int -> IO ()
-test2I n = Prelude.print $ runIdentity $ runIdentityT $ unstack (foldML' 0 (\acc _ -> return ((1 :: Int) + acc))) $ hugeI n
+test2I n = Prelude.print $ runIdentity $ runIdentityT $ (rfoldl'  ( hugeI n) (\acc _ -> return ((1 :: Int) + acc)) 0) 
 
-streamBST2 :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
-streamBST2 bt = rfoldr bt (\a () -> StP.yield a) ()
 
-lenBST2 :: Monad m => Fix (Compose m (BT a)) -> m Int
-lenBST2 bt = runIdentityT $ rfoldl' bt (\acc _ -> return (acc + 1)) 0
-
-test3 :: Int -> IO ()
-test3 n = Prelude.print =<< StP.length (streamBST2 (huge n))
-
-test4 :: Int -> IO ()
-test4 n = Prelude.print $ runIdentity (lenBST2 (hugeI n))
-
--- y :: _
--- y = Sch.unstack2 Sch.foldMR2
-
--- x :: Monad m => Fix (Compose m (BT a)) -> (a -> b -> m b) -> b -> m b -- Monad m => Fix (Compose m (BT a)) -> MFoldR a b m b -- Monad m => Fix (Compose m (BT a)) -> (a -> b -> m b) -> b -> m b
--- x bt = Sch.runMFoldR (Sch.unstack2 Sch.foldMR2 bt)
 
 
 
