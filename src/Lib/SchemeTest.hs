@@ -58,10 +58,10 @@ test2I :: Int -> IO ()
 test2I n = Prelude.print $ runIdentity $ runIdentityT $ unstack (foldML' 0 (\acc _ -> return ((1 :: Int) + acc))) $ hugeI n
 
 streamBST2 :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
-streamBST2 bt = Sch.runMFoldR (Sch.unstack2 Sch.foldMR2 bt) (\a () -> StP.yield a) ()
+streamBST2 bt = rfoldr bt (\a () -> StP.yield a) ()
 
 lenBST2 :: Monad m => Fix (Compose m (BT a)) -> m Int
-lenBST2 bt = runIdentityT $ Sch.runMFoldL (Sch.unstack2 Sch.foldML2' bt) (\acc _ -> return (acc + 1)) 0
+lenBST2 bt = runIdentityT $ rfoldl' bt (\acc _ -> return (acc + 1)) 0
 
 test3 :: Int -> IO ()
 test3 n = Prelude.print =<< StP.length (streamBST2 (huge n))
