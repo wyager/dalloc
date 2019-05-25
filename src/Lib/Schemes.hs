@@ -36,31 +36,29 @@ class FoldFix (g :: * -> * -> *) where
            => (forall m . Monad m => Monad (t m)) 
            => MonadTrans t
            => forall m . Monad m 
-           => forall z . (z -> (a -> b -> t m b) -> b -> t m b)
-           -> g a z
-           -> (a -> b -> t m b) -> b -> t m b
+           => forall z . ((a -> b -> t m b) -> b -> z -> t m b)
+           -> (a -> b -> t m b) -> b -> g a z -> t m b
     rfoldl'_ :: forall a b t . () 
            => (forall m . Monad m => Monad (t m)) 
            => MonadTrans t
            => forall m . Monad m 
-           => forall z . (z -> (b -> a -> t m b) -> b -> t m b)
-           -> g a z
-           -> (b -> a -> t m b) -> b -> t m b
+           => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
+           -> (b -> a -> t m b) -> b -> g a z -> t m b
 
 
 instance FoldFix BT where
-    rfoldr_ rec g = \f b0 -> case g of
+    rfoldr_ rec = \f b0 g -> case g of
             N a gl gr-> do
-                br <- rec gr f b0
+                br <- rec f b0 gr
                 bm <- f a br
-                bl <- rec gl f bm
+                bl <- rec f bm gl
                 return bl
             L -> return b0
-    rfoldl'_ rec g = \f b0 -> case g of
+    rfoldl'_ rec = \f b0 g -> case g of
             N a gl gr-> do
-                !bl <- rec gl f b0
+                !bl <- rec f b0 gl
                 !bm <- f bl a
-                !br <- rec gr f bm
+                !br <- rec f bm gr
                 return br
             L -> return b0
 
@@ -76,11 +74,16 @@ unstack f = go
     go :: Fix (Compose m g) -> t m a
     go = f go <=< lift . getCompose . unFix 
 
+-- I would like to thank the GHC optimizer
+-- This annoying stuff is due to unstack imposing a different order than the standard fold argument order
+rfoldr :: forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (a -> b -> t m b) -> b -> Fix (Compose m (g a)) -> t m b
+rfoldr f b0 g = runMFoldR (unstack step g) f b0
+  where
+  step :: forall z n . Monad n => (z -> MFoldR a b t n b) -> g a z -> MFoldR a b t n b
+  step zf gaz = MFoldR $ \abt b -> rfoldr_ (\abt' b' z -> runMFoldR (zf z) abt' b') abt b gaz
 
-rfoldr :: forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => Fix (Compose m (g a)) -> (a -> b -> t m b) -> b -> t m b
-rfoldr   = runMFoldR . unstack (\zf -> MFoldR . rfoldr_ (runMFoldR . zf)) 
-
-rfoldl' ::  forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => Fix (Compose m (g a)) -> (b -> a -> t m b) -> b -> t m b
-rfoldl'   = runMFoldL . unstack (\zf -> MFoldL . rfoldl'_ (runMFoldL . zf)) 
-
-
+rfoldl' :: forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> a -> t m b) -> b -> Fix (Compose m (g a)) -> t m b
+rfoldl' f b0 g = runMFoldL (unstack step g) f b0
+  where
+  step :: forall z n . Monad n => (z -> MFoldL a b t n b) -> g a z -> MFoldL a b t n b
+  step zf gaz = MFoldL $ \bat b -> rfoldl'_ (\bat' b' z -> runMFoldL (zf z) bat' b') bat b gaz

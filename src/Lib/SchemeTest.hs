@@ -11,7 +11,7 @@ import Control.Monad.Trans.Identity (runIdentityT)
 -- TODO: Get the args in the right order for foldr/foldl
 
 streamBST :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
-streamBST bt = rfoldr bt (\a () -> StP.yield a) ()
+streamBST = rfoldr (\a () -> StP.yield a) ()
 
 huge :: Int -> Fix (Compose IO (BT Int))
 huge depth = go 0 1
@@ -46,13 +46,13 @@ testS n = Prelude.print $ flip State.runState 0 $ StP.length $ streamBST $ hugeS
 
 
 test2S :: Int -> IO ()
-test2S n = Prelude.print $ flip State.runState 0 $ runIdentityT $ (rfoldl' ( hugeS n)  (\acc x -> return (x + acc)) 0)
+test2S n = Prelude.print $ flip State.runState 0 $ runIdentityT $ (rfoldl'   (\acc x -> return (x + acc)) 0 ( hugeS n))
 
 testI :: Int -> IO ()
 testI n = Prelude.print $ runIdentity $ StP.length $ streamBST $ hugeI n
 
 test2I :: Int -> IO ()
-test2I n = Prelude.print $ runIdentity $ runIdentityT $ (rfoldl'  ( hugeI n) (\acc _ -> return ((1 :: Int) + acc)) 0) 
+test2I n = Prelude.print $ runIdentity $ runIdentityT $ (rfoldl'   (\acc _ -> return ((1 :: Int) + acc)) 0 ( hugeI n)) 
 
 
 
