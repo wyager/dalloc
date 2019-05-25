@@ -2,7 +2,7 @@
 module Lib.Data where
 
 
-import           Lib.GiSTf (Hoist)
+import           Lib.GiSTf (Lift)
 import           Lib.System (ByteSemantics, semanticIsRoot, semanticChildren, IsRoot(NotRoot,YesRoot), NoParse(..), Ref)
 import           Data.ByteString (ByteString)
 import           Data.Map.Strict (Map)
@@ -31,7 +31,7 @@ data Ser (f :: * -> *) (a :: Tag) where
 data SomeSer f where
     SomeSer :: Ser f a -> SomeSer f
 
-instance (Hoist Store f) => Store (SomeSer f) where
+instance (Lift Store f) => Store (SomeSer f) where
     size = VarSize $ \(SomeSer s) -> case s of
                         Node theMap -> sizeOf Node' + sizeOf theMap
                         Leaf bs -> sizeOf Leaf' + sizeOf bs

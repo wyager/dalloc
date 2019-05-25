@@ -12,6 +12,7 @@ import GHC.Exts (Constraint)
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
 import qualified Data.Vector.Unboxed as U
+-- import qualified Lib.Schemes as S
 
 data Nat = Z | S Nat
 
@@ -36,6 +37,7 @@ data Freen (n :: Nat) f a where
     Pure :: a -> Freen 'Z f a
     Free :: f (Freen n f a) -> Freen ('S n) f a
 
+
 iterM :: (Monad m, Functor f) => (f (m a) -> m a) -> Freen n f a -> m a
 iterM _ (Pure a) = return a
 iterM g (Free f) = g (fmap (iterM g) f)
@@ -44,18 +46,22 @@ instance Functor f => Functor (Freen n f) where
     fmap f (Pure a) = Pure (f a)
     fmap f (Free g) = Free (fmap (fmap f) g)
 
-type Hoist c f = (forall s . c s => c (f s) :: Constraint)
+type Lift c f = (forall s . c s => c (f s) :: Constraint)
 
-instance (Hoist Show f, Show a) => Show (Freen height f a) where
+instance (Lift Show f, Show a) => Show (Freen height f a) where
     show (Pure a) = "Pure " ++ show a
     show (Free f) = "Free " ++ show f
 
 newtype Node set a = Node (V.Vector (set,a)) deriving (Functor, Show)
 
+-- instance S.FoldFix Node where
+--     rfoldr_ rec (Node vec) f b = 
+--         Vec.foldr 
+
 type Rec height f vec set key value = Freen height (Node set ∘ f) (vec (key,value))
 newtype GiSTn height f vec set key value = GiSTn (Rec height f vec set key value)
 
-instance (Hoist Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiSTn height f vec set key value) where
+instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiSTn height f vec set key value) where
     show (GiSTn gist) = case gist of
         Pure a -> "Leaf " ++ show a
         Free (Compose (Node vec)) -> "Node " ++ show (fmap (\(set,node) -> (set,fmap GiSTn node)) vec)
@@ -225,7 +231,7 @@ instance (Ord a, Num a) => Key a (Within a) where
 data GiST f vec set key value where
     GiST :: GiSTn height f vec set key value -> GiST f vec set key value
 
-instance (Hoist Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
+instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
     show (GiST g) = show g
 
 
@@ -239,5 +245,6 @@ empty = GiST (GiSTn (Pure Vec.empty))
 
 list :: (Monad f, IsGiST vec set key value) => set -> GiST f vec set key value -> f (vec (key,value))
 list set (GiST g) = list' set g
+
 
 

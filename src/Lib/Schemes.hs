@@ -31,7 +31,7 @@ instance MonadTrans t => MonadTrans (MFoldL a b t) where
     lift m = MFoldL $ \ _ _ -> lift m
 
 
-class FoldFix g where
+class FoldFix (g :: * -> * -> *) where
     rfoldr_ :: forall t a b . () 
            => (forall m . Monad m => Monad (t m)) 
            => MonadTrans t
