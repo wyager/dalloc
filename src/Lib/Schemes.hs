@@ -7,14 +7,6 @@ import Control.Monad ((<=<))
 import Control.Monad.Trans.Reader (ReaderT(..))
 
 
-data BT a r = N a r r | L
-
-
-l_ :: Applicative m => Fix (Compose m (BT a))
-l_ = Fix (Compose (pure L))
-
-n_ :: Applicative m => a -> Fix (Compose m (BT a)) -> Fix (Compose m (BT a)) -> Fix (Compose m (BT a))
-n_ a l r = Fix (Compose (pure (N a l r)))
 
 
 
@@ -46,23 +38,9 @@ class FoldFix (g :: * -> * -> *) where
            -> (b -> a -> t m b) -> b -> g a z -> t m b
 
 
-instance FoldFix BT where
-    rfoldr_ rec = \f b0 g -> case g of
-            N a gl gr-> do
-                br <- rec f b0 gr
-                bm <- f a br
-                bl <- rec f bm gl
-                return bl
-            L -> return b0
-    rfoldl'_ rec = \f b0 g -> case g of
-            N a gl gr-> do
-                !bl <- rec f b0 gl
-                !bm <- f bl a
-                !br <- rec f bm gr
-                return br
-            L -> return b0
 
 
+{-# INLINE unstack #-}
 unstack :: forall t m a g  . ()
         => Monad m 
         => (forall n . Monad n => Monad (t n))
@@ -76,12 +54,14 @@ unstack f = go
 
 -- I would like to thank the GHC optimizer
 -- This annoying stuff is due to unstack imposing a different order than the standard fold argument order
+{-# INLINEABLE rfoldr #-}
 rfoldr :: forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (a -> b -> t m b) -> b -> Fix (Compose m (g a)) -> t m b
 rfoldr f b0 g = runMFoldR (unstack step g) f b0
   where
   step :: forall z n . Monad n => (z -> MFoldR a b t n b) -> g a z -> MFoldR a b t n b
   step zf gaz = MFoldR $ \abt b -> rfoldr_ (\abt' b' z -> runMFoldR (zf z) abt' b') abt b gaz
 
+{-# INLINEABLE rfoldl' #-}
 rfoldl' :: forall a b g m t. (FoldFix g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> a -> t m b) -> b -> Fix (Compose m (g a)) -> t m b
 rfoldl' f b0 g = runMFoldL (unstack step g) f b0
   where

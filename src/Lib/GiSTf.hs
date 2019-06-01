@@ -54,9 +54,7 @@ instance (Lift Show f, Show a) => Show (Freen height f a) where
 
 newtype Node set a = Node (V.Vector (set,a)) deriving (Functor, Show)
 
--- instance S.FoldFix Node where
---     rfoldr_ rec (Node vec) f b = 
---         Vec.foldr 
+
 
 type Rec height f vec set key value = Freen height (Node set ∘ f) (vec (key,value))
 newtype GiSTn height f vec set key value = GiSTn (Rec height f vec set key value)

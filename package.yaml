@@ -102,6 +102,7 @@ executables:
     - -rtsopts
     - -with-rtsopts=-N
     - -O2
+    - -fspecialize-aggressively
     dependencies:
     - dalloc
     - bytestring
