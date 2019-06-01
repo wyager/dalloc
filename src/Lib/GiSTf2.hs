@@ -4,8 +4,8 @@
 module Lib.GiSTf2 where
 
 -- import GHC.TypeLits (Nat, type (+))
-import qualified Data.Vector as V (Vector, fromList)
-import Data.Vector.Generic as Vec (Vector, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import qualified Data.Vector as V (Vector)-- , fromList)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
 -- import Data.Semigroup (Min(Min,getMin))
 -- import Data.Foldable (fold)
