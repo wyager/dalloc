@@ -5,10 +5,10 @@ module Lib.GiSTf2 where
 
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector)-- , fromList)
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, foldr) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
 -- import Data.Semigroup (Min(Min,getMin))
-import Data.Foldable (foldrM)
+import Data.Foldable (foldrM, foldlM)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose)
 import GHC.Exts (Constraint)
@@ -58,26 +58,25 @@ type Lift c f = (forall s . c s => c (f s) :: Constraint)
 --            -> (b -> a -> t m b) -> b -> g a j z -> t m b
 
 
-data FoldWithKey vec set key value n rec where
-    FoldWithKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithKey vec set key value n rec
+data FoldWithoutKey vec set key value n rec where
+    FoldWithoutKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithoutKey vec set key value n rec
+
+data FoldWithKey vec set kv n rec where
+    FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithKey vec set kv n rec
 
 
-instance FoldFixI (FoldWithKey vec set key) where
+instance FoldFixI (FoldWithoutKey vec set key) where
     {-# INLINEABLE rfoldri_ #-}
-    rfoldri_ rec = \f b0 (FoldWithKey g) -> case g of
+    rfoldri_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldr (\(k,v) acc -> f v =<< acc) (return b0) vec -- 
         Node vec -> foldrM go b0 vec
             where
             go (set,subtree) acc = rec f acc subtree
-
-            -- N a gl gr-> do
-            --     br <- rec f b0 gr
-            --     bm <- f a br
-            --     bl <- rec f bm gl
-            --     return bl
-            -- L -> return b0
-
-    -- rfoldr_ rec = 
+    rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
+        Leaf vec -> Vec.foldl' (\acc (k,v) -> acc >>= flip f v) (return b0) vec -- 
+        Node vec -> foldlM go b0 vec
+            where
+            go  acc (set,subtree) = rec f acc subtree
 
 data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
