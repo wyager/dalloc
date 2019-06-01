@@ -1,6 +1,8 @@
 -- Attempting to reconcile depth-typed GiST with Schemes
 
 {-# LANGUAGE UndecidableInstances #-} -- Show constraints
+{-# OPTIONS_GHC -fno-warn-orphans #-}
+
 module Lib.GiSTf2 where
 
 -- import GHC.TypeLits (Nat, type (+))
@@ -68,15 +70,28 @@ data FoldWithKey vec set kv n rec where
 instance FoldFixI (FoldWithoutKey vec set key) where
     {-# INLINEABLE rfoldri_ #-}
     rfoldri_ rec = \f b0 (FoldWithoutKey g) -> case g of
-        Leaf vec -> Vec.foldr (\(k,v) acc -> f v =<< acc) (return b0) vec -- 
+        Leaf vec -> Vec.foldr (\(_k,v) acc -> f v =<< acc) (return b0) vec -- 
         Node vec -> foldrM go b0 vec
             where
-            go (set,subtree) acc = rec f acc subtree
+            go (_set,subtree) acc = rec f acc subtree
     rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
-        Leaf vec -> Vec.foldl' (\acc (k,v) -> acc >>= flip f v) (return b0) vec -- 
+        Leaf vec -> Vec.foldl' (\acc (_k,v) -> acc >>= flip f v) (return b0) vec -- 
         Node vec -> foldlM go b0 vec
             where
-            go  acc (set,subtree) = rec f acc subtree
+            go  acc (_set,subtree) = rec f acc subtree
+
+instance FoldFixI (FoldWithKey vec set) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithKey g) -> case g of
+        Leaf vec -> Vec.foldr (\kv acc -> f kv =<< acc) (return b0) vec -- 
+        Node vec -> foldrM go b0 vec
+            where
+            go (_set,subtree) acc = rec f acc subtree
+    rfoldli'_ rec = \f b0 (FoldWithKey g) -> case g of
+        Leaf vec -> Vec.foldl' (\acc kv -> acc >>= flip f kv) (return b0) vec -- 
+        Node vec -> foldlM go b0 vec
+            where
+            go  acc (_set,subtree) = rec f acc subtree
 
 data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
