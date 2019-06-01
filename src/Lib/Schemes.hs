@@ -5,6 +5,7 @@ import Data.Fix (Fix(..))
 import Data.Functor.Compose (Compose(..))
 import Control.Monad ((<=<))
 import Control.Monad.Trans.Reader (ReaderT(..))
+import Data.Void (Void, absurd, vacuous)
 
 
 
@@ -38,19 +39,7 @@ class FoldFix (g :: * -> * -> *) where
            -> (b -> a -> t m b) -> b -> g a z -> t m b
 
 
-class FoldFixI (g :: * -> Nat -> * -> *) where
-    rfoldri_ :: forall t a b j . () 
-           => (forall m . Monad m => Monad (t m)) 
-           => MonadTrans t
-           => forall m . Monad m 
-           => forall z . ((a -> b -> t m b) -> b -> z -> t m b)
-           -> (a -> b -> t m b) -> b -> g a j z -> t m b
-    rfoldli'_ :: forall a b t j . () 
-           => (forall m . Monad m => Monad (t m)) 
-           => MonadTrans t
-           => forall m . Monad m 
-           => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
-           -> (b -> a -> t m b) -> b -> g a j z -> t m b
+
 
 
 
@@ -65,30 +54,6 @@ unstack f = go
     where
     go :: Fix (Compose m g) -> t m a
     go = f go <=< lift . getCompose . unFix 
-
-data Void
-
-absurd :: Void -> a
-absurd impossible = case impossible of 
-
-data Nat = Z | S Nat
-data FixN n f where
-    FixZ :: f  'Z     Void      -> FixN  'Z     f
-    FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
-newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
-
-{-# INLINE unstackI #-}
-unstackI :: forall t m a g i  . ()
-        => Monad m 
-        => (forall n . Monad n => Monad (t n))
-        => MonadTrans t
-        => (forall n z j . Monad n => (z -> t n a) -> g j z -> t n a)
-        -> FixN i (ComposeI m g) -> t m a
-unstackI f = go
-    where
-    go :: forall j . FixN j (ComposeI m g) -> t m a
-    go (FixZ (ComposeI mg)) = f absurd =<< lift mg
-    go (FixN (ComposeI mg)) = f go     =<< lift mg
 
 -- I would like to thank the GHC optimizer
 -- This annoying stuff is due to unstack imposing a different order than the standard fold argument order
@@ -106,6 +71,47 @@ rfoldl' f b0 g = runMFoldL (unstack step g) f b0
   where
   step :: forall z n . Monad n => (z -> MFoldL a b t n b) -> g a z -> MFoldL a b t n b
   step zf gaz = MFoldL $ \bat b -> rfoldl'_ (\bat' b' z -> runMFoldL (zf z) bat' b') bat b gaz
+
+class FoldFixI (g :: * -> Nat -> * -> *) where
+    rfoldri_ :: forall t a b j . () 
+           => (forall m . Monad m => Monad (t m)) 
+           => MonadTrans t
+           => forall m . Monad m 
+           => forall z . ((a -> b -> t m b) -> b -> z -> t m b)
+           -> (a -> b -> t m b) -> b -> g a j z -> t m b
+    rfoldli'_ :: forall a b t j . () 
+           => (forall m . Monad m => Monad (t m)) 
+           => MonadTrans t
+           => forall m . Monad m 
+           => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
+           -> (b -> a -> t m b) -> b -> g a j z -> t m b
+
+
+data Nat = Z | S Nat
+data FixN n f where
+    FixZ :: f  'Z     Void      -> FixN  'Z     f
+    FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
+newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
+
+
+cataNM :: (forall n' . Traversable (f n'), Monad m) => (forall n' . f n' a -> m a) -> FixN n f -> m a
+cataNM g (FixZ f) = g (vacuous f)
+cataNM g (FixN f) = g =<< (traverse (cataNM g) f)
+
+{-# INLINE unstackI #-}
+unstackI :: forall t m a g i  . ()
+        => Monad m 
+        => (forall n . Monad n => Monad (t n))
+        => MonadTrans t
+        => (forall n z j . Monad n => (z -> t n a) -> g j z -> t n a)
+        -> FixN i (ComposeI m g) -> t m a
+unstackI f = go
+    where
+    go :: forall j . FixN j (ComposeI m g) -> t m a
+    go (FixZ (ComposeI mg)) = f absurd =<< lift mg
+    go (FixN (ComposeI mg)) = f go     =<< lift mg
+
+
 
 {-# INLINEABLE rfoldri #-}
 rfoldri :: forall a b g m t j . (FoldFixI g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (a -> b -> t m b) -> b -> FixN j (ComposeI m (g a)) -> t m b

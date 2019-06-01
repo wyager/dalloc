@@ -5,20 +5,20 @@ module Lib.GiSTf2 where
 
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector)-- , fromList)
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, foldr) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
 -- import Data.Semigroup (Min(Min,getMin))
--- import Data.Foldable (fold)
+import Data.Foldable (foldrM)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose)
 import GHC.Exts (Constraint)
 -- import Data.Proxy (Proxy(Proxy))
 -- import Data.Functor.Identity (Identity(..))
 import qualified Data.Vector.Unboxed as U
-import Data.Void (Void, vacuous)
+import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,rfoldri_, rfoldli'_)
 -- import qualified Lib.Schemes as S
 
-data Nat = Z | S Nat
+-- data Nat = Z | S Nat
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -27,9 +27,13 @@ data V2 x = V2 x x
 type f ∘ g = Compose f g
 
 
-data FixN n f where
-    FixZ :: f  'Z     Void      -> FixN  'Z     f
-    FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
+instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
+    show (FixZ f) = show f
+    show (FixN f) = show f
+
+-- data FixN n f where
+--     FixZ :: f  'Z     Void      -> FixN  'Z     f
+--     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
 
 type Lift c f = (forall s . c s => c (f s) :: Constraint)
 -- type LiftI c f = (forall n s . c s => c (f n s) :: Constraint)
@@ -39,20 +43,48 @@ type Lift c f = (forall s . c s => c (f s) :: Constraint)
 
 
 
-instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
-    show (FixZ f) = show f
-    show (FixN f) = show f
+-- class FoldFixI (g :: * -> Nat -> * -> *) where
+--     rfoldri_ :: forall t a b j . () 
+--            => (forall m . Monad m => Monad (t m)) 
+--            => MonadTrans t
+--            => forall m . Monad m 
+--            => forall z . ((a -> b -> t m b) -> b -> z -> t m b)
+--            -> (a -> b -> t m b) -> b -> g a j z -> t m b
+--     rfoldli'_ :: forall a b t j . () 
+--            => (forall m . Monad m => Monad (t m)) 
+--            => MonadTrans t
+--            => forall m . Monad m 
+--            => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
+--            -> (b -> a -> t m b) -> b -> g a j z -> t m b
 
-cataNM g (FixZ f) = g (vacuous f)
-cataNM g (FixN f) = g =<< (traverse (cataNM g) f)
 
+data FoldWithKey vec set key value n rec where
+    FoldWithKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithKey vec set key value n rec
+
+
+instance FoldFixI (FoldWithKey vec set key) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithKey g) -> case g of
+        Leaf vec -> Vec.foldr (\(k,v) acc -> f v =<< acc) (return b0) vec -- 
+        Node vec -> foldrM go b0 vec
+            where
+            go (set,subtree) acc = rec f acc subtree
+
+            -- N a gl gr-> do
+            --     br <- rec f b0 gr
+            --     bm <- f a br
+            --     bl <- rec f bm gl
+            --     return bl
+            -- L -> return b0
+
+    -- rfoldr_ rec = 
 
 data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
     Node :: V.Vector (set, rec) -> GiSTr vec set key value ('S n) rec
 
 
-newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
+-- newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
 
 data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
 
@@ -82,7 +114,6 @@ class Ord (Penalty set) => Key key set | set -> key where
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
     insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
 
-cataNM :: (forall n' . Traversable (f n'), Monad m) => (forall n' . f n' a -> m a) -> FixN n f -> m a
 
 
 class (Vector vec (key,value), Key key set) => IsGiST vec set key value 
