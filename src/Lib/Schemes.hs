@@ -6,6 +6,8 @@ import Data.Functor.Compose (Compose(..))
 import Control.Monad ((<=<))
 import Control.Monad.Trans.Reader (ReaderT(..))
 import Data.Void (Void, absurd, vacuous)
+import GHC.Exts (Constraint)
+
 
 
 
@@ -89,9 +91,27 @@ class FoldFixI (g :: * -> Nat -> * -> *) where
 
 data Nat = Z | S Nat
 data FixN n f where
-    FixZ :: f  'Z     Void      -> FixN  'Z     f
+    FixZ :: f  'Z     Void      -> FixN  'Z    f
     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
 newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
+
+instance (Functor f, Functor (g n)) => Functor (ComposeI f g n) where
+  fmap q (ComposeI f) = ComposeI $ fmap (fmap q) f
+
+swozzle :: Functor f => (forall m b . g m b -> h m b) -> ComposeI f g n a -> ComposeI f h n a
+swozzle q (ComposeI f) = ComposeI (fmap q f)
+
+
+type Lift c f = (forall s . c s => c (f s) :: Constraint)
+
+
+hoistNL :: (forall n . Functor (f n)) => (forall n a . f n a -> g n a) -> FixN m f -> FixN m g
+hoistNL t (FixZ f) = FixZ (t f)
+hoistNL t (FixN f) = FixN (t (fmap (hoistNL t) f))
+
+hoistNR :: (forall n . Functor (g n)) => (forall n a . f n a -> g n a) -> FixN m f -> FixN m g
+hoistNR t (FixZ f) = FixZ (t f)
+hoistNR t (FixN f) = FixN (fmap (hoistNR t) (t f))
 
 
 cataNM :: (forall n' . Traversable (f n'), Monad m) => (forall n' . f n' a -> m a) -> FixN n f -> m a

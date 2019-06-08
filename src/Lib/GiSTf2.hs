@@ -7,17 +7,19 @@ module Lib.GiSTf2 where
 
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector)-- , fromList)
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import qualified Data.Vector.Generic as Vec (foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
 -- import Data.Semigroup (Min(Min,getMin))
-import Data.Foldable (foldrM, foldlM)
+import qualified Data.Foldable as Foldable (foldrM, foldlM)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose)
-import GHC.Exts (Constraint)
 -- import Data.Proxy (Proxy(Proxy))
 -- import Data.Functor.Identity (Identity(..))
 import qualified Data.Vector.Unboxed as U
-import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,rfoldri_, rfoldli'_)
+import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri, hoistNL, swozzle)
+import Control.Monad.Trans.Identity (runIdentityT)
+import Control.Monad.Trans.Class (MonadTrans)
 -- import qualified Lib.Schemes as S
 
 -- data Nat = Z | S Nat
@@ -37,7 +39,6 @@ instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
 --     FixZ :: f  'Z     Void      -> FixN  'Z     f
 --     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
 
-type Lift c f = (forall s . c s => c (f s) :: Constraint)
 -- type LiftI c f = (forall n s . c s => c (f n s) :: Constraint)
 
 
@@ -71,12 +72,12 @@ instance FoldFixI (FoldWithoutKey vec set key) where
     {-# INLINEABLE rfoldri_ #-}
     rfoldri_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldr (\(_k,v) acc -> f v =<< acc) (return b0) vec -- 
-        Node vec -> foldrM go b0 vec
+        Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set,subtree) acc = rec f acc subtree
     rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc (_k,v) -> acc >>= flip f v) (return b0) vec -- 
-        Node vec -> foldlM go b0 vec
+        Node vec -> Foldable.foldlM go b0 vec
             where
             go  acc (_set,subtree) = rec f acc subtree
 
@@ -84,18 +85,22 @@ instance FoldFixI (FoldWithKey vec set) where
     {-# INLINEABLE rfoldri_ #-}
     rfoldri_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldr (\kv acc -> f kv =<< acc) (return b0) vec -- 
-        Node vec -> foldrM go b0 vec
+        Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set,subtree) acc = rec f acc subtree
     rfoldli'_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc kv -> acc >>= flip f kv) (return b0) vec -- 
-        Node vec -> foldlM go b0 vec
+        Node vec -> Foldable.foldlM go b0 vec
             where
             go  acc (_set,subtree) = rec f acc subtree
 
 data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
     Node :: V.Vector (set, rec) -> GiSTr vec set key value ('S n) rec
+
+instance Functor (GiSTr vec set k v n) where
+    fmap _ (Leaf v) = Leaf v
+    fmap f (Node v) = Node $ fmap (\(s,r) -> (s,f r)) v 
 
 
 -- newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
@@ -298,11 +303,45 @@ list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gis
 
 
 
--- data GiST f vec set key value where
---     GiST :: GiSTn height f vec set key value -> GiST f vec set key value
+data GiST f vec set key value where
+    GiST :: GiSTn f vec set key value height -> GiST f vec set key value
 
--- instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
---     show (GiST g) = show g
+instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
+    show (GiST g) = show g
+
+foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (v -> b -> t m b) -> b -> GiST m vec set key v -> t m b
+foldrM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithoutKey) g
+
+
+foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => ((k,v) -> b -> t m b) -> b -> GiST m vec set k v -> t m b
+foldriM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithKey) g
+
+
+foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> v -> t m b) -> b -> GiST m vec set key v -> t m b
+foldlM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithoutKey) g
+
+foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> (k,v) -> t m b) -> b -> GiST m vec set k v -> t m b
+foldliM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithKey) g
+
+
+cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
+cronk f a b = return (f a b)
+
+foldr :: (Monad m, Vector vec (key,v)) => (v -> b -> b) -> b -> GiST m vec set key v -> m b
+foldr f b = runIdentityT . foldrM (cronk f) b 
+
+foldri :: (Monad m, Vector vec (k,v)) => ((k,v) -> b -> b) -> b -> GiST m vec set k v -> m b
+foldri f b = runIdentityT . foldriM (cronk f) b 
+
+
+foldl' :: (Monad m, Vector vec (key,v)) => (b -> v -> b) -> b -> GiST m vec set key v -> m b
+foldl' f b = runIdentityT . foldlM' (cronk f) b 
+
+foldli' :: (Monad m, Vector vec (k,v)) => (b -> (k,v) -> b) -> b -> GiST m vec set k v -> m b
+foldli' f b = runIdentityT . foldliM' (cronk f) b
+
+-- sum :: (Num a, Monad f, Vector vec (key, a)) => GiST f vec set key a -> f a
+-- sum  = runIdentityT . foldl' (\a b -> return (a + b)) 0
 
 
 -- insert :: (Monad read, Functor write, RW read write vec set key value)  
