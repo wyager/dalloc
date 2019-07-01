@@ -15,11 +15,14 @@ import qualified Data.Foldable as Foldable (foldrM, foldlM)
 -- import Control.Monad.Free (Free(Free,Pure))
 import Data.Functor.Compose (Compose)
 -- import Data.Proxy (Proxy(Proxy))
--- import Data.Functor.Identity (Identity(..))
+import Data.Functor.Identity (Identity(..))
 import qualified Data.Vector.Unboxed as U
 import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri, hoistNL, swozzle)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
+import Data.Functor.Sum (Sum(InL,InR))
+-- import Data.Void (Void)
+
 -- import qualified Lib.Schemes as S
 
 -- data Nat = Z | S Nat
@@ -68,6 +71,24 @@ data FoldWithKey vec set kv n rec where
     FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithKey vec set kv n rec
 
 
+data FoldWithVec set vec_kv n rec where
+    FoldWithVec :: (Vector vec kv, vec_kv ~ vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithVec set vec_kv n rec
+
+
+instance FoldFixI (FoldWithVec set) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithVec g) -> case g of
+        Leaf vec -> f vec b0
+        Node vec -> Foldable.foldrM go b0 vec
+            where
+            go (_set,subtree) acc = rec f acc subtree
+    {-# INLINEABLE rfoldli'_ #-}
+    rfoldli'_ rec = \f b0 (FoldWithVec g) -> case g of
+        Leaf vec -> f b0 vec 
+        Node vec -> Foldable.foldlM go b0 vec
+            where
+            go  acc (_set,subtree) = rec f acc subtree
+
 instance FoldFixI (FoldWithoutKey vec set key) where
     {-# INLINEABLE rfoldri_ #-}
     rfoldri_ rec = \f b0 (FoldWithoutKey g) -> case g of
@@ -75,6 +96,7 @@ instance FoldFixI (FoldWithoutKey vec set key) where
         Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set,subtree) acc = rec f acc subtree
+    {-# INLINEABLE rfoldli'_ #-}
     rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc (_k,v) -> acc >>= flip f v) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
@@ -88,6 +110,7 @@ instance FoldFixI (FoldWithKey vec set) where
         Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set,subtree) acc = rec f acc subtree
+    {-# INLINEABLE rfoldli'_ #-}
     rfoldli'_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc kv -> acc >>= flip f kv) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
@@ -202,16 +225,16 @@ list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gis
 -- contains predicate = getAny . search' (const (Any True)) predicate
 
 
+-- f must be included to do the actual work of serializing an f via w
+class RW m r w f | m -> r w where
+    save :: f (Sum r w x) -> m (w (f x))
 
--- class (IsGiST vec set key value) => RW read write vec set key value | write -> read where
---     saveLeaf :: vec (key, value) -> write (Rec 'Z           write vec set key value)
---     saveNode :: Node set (Either   (write (Rec height       write vec set key value)) 
---                                    (read  (Rec height       read  vec set key value))) 
---                                  -> write (Rec ('S height)  write vec set key value) -- Save node
+instance Traversable f => RW Identity Identity Identity f where
+    save f = Identity $ flip traverse f $ \case
+                InL x -> x
+                InR x -> x
 
--- instance IsGiST vec set key value => RW Identity Identity vec set key value where
---     saveLeaf = Identity . Pure
---     saveNode = Identity . Free . Compose . fmap (either id id)
+
 
 -- insert' :: forall write height read vec set key value .  (Monad read, Functor write, RW read write vec set key value)  
 --        => FillFactor -> key -> value 
@@ -220,11 +243,13 @@ list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gis
 --             One (_set, gist) -> return $ fmap (Left  . GiSTn) $ gist
 --             Two a b         -> return $ fmap (Right . GiSTn) $ saveNode $ Node $ V.fromList [fmap Left a, fmap Left b]
         
--- insertAndSplit :: forall write height read vec set key value . (Monad read, RW read write vec set key value) 
---                => FillFactor
---                -> key -> value
---                ->                         Rec height read vec set key value     -- The thing to save
---                -> read (AFew (set, write (Rec height write vec set key value))) -- That which has been saved
+insertAndSplit :: forall m r w vec set k v h x
+               . (Monad m, (forall h' . RW m r w (GiSTr vec set k v h'))) 
+               => FillFactor
+               -> k -> v
+               ->             GiSTr vec set k v h (r x)     -- The thing to save
+               -> m (AFew (w (GiSTr vec set k v h (w x)))) -- That which has been saved
+insertAndSplit = undefined
 -- insertAndSplit ff@FillFactor{..} key value free  = case free of
 --         Pure vec -> return $ fmap (\leaf -> (unions (preds (GiSTn (Pure leaf))), saveLeaf leaf)) $ insertKey (Proxy @set) ff key value vec 
 --         node@(Free (Compose (Node vec))) -> 
@@ -244,7 +269,20 @@ list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gis
 --                             case partitionSets ff vec' bestIx (V2 (fmap Left l) (fmap Left r)) of 
 --                                 One vec'' -> return (One (wrap vec''))
 --                                 Two v1 v2 -> return (Two (wrap v1) (wrap v2))
---                     -- return (fmap save inserted)
+
+
+
+-- class (IsGiST vec set key value) => RW read write vec set key value | write -> read where
+--     saveLeaf :: vec (key, value) -> write (Rec 'Z           write vec set key value)
+--     saveNode :: Node set (Either   (write (Rec height       write vec set key value)) 
+--                                    (read  (Rec height       read  vec set key value))) 
+--                                  -> write (Rec ('S height)  write vec set key value) -- Save node
+
+-- instance IsGiST vec set key value => RW Identity Identity vec set key value where
+--     saveLeaf = Identity . Pure
+--     saveNode = Identity . Free . Compose . fmap (either id id)
+
+
 
 
 -- data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
@@ -317,11 +355,20 @@ foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Mona
 foldriM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithKey) g
 
 
+foldrvM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (vec (k,v) -> b -> t m b) -> b -> GiST m vec set k v -> t m b
+foldrvM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithVec) g
+
+
+
 foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> v -> t m b) -> b -> GiST m vec set key v -> t m b
 foldlM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithoutKey) g
 
 foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> (k,v) -> t m b) -> b -> GiST m vec set k v -> t m b
 foldliM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithKey) g
+
+foldlvM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> vec (k,v) -> t m b) -> b -> GiST m vec set k v -> t m b
+foldlvM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithVec) g
+
 
 
 cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
@@ -333,12 +380,18 @@ foldr f b = runIdentityT . foldrM (cronk f) b
 foldri :: (Monad m, Vector vec (k,v)) => ((k,v) -> b -> b) -> b -> GiST m vec set k v -> m b
 foldri f b = runIdentityT . foldriM (cronk f) b 
 
+foldrv :: (Monad m, Vector vec (k,v)) => (vec (k,v) -> b -> b) -> b -> GiST m vec set k v -> m b
+foldrv f b = runIdentityT . foldrvM (cronk f) b 
+
 
 foldl' :: (Monad m, Vector vec (key,v)) => (b -> v -> b) -> b -> GiST m vec set key v -> m b
 foldl' f b = runIdentityT . foldlM' (cronk f) b 
 
 foldli' :: (Monad m, Vector vec (k,v)) => (b -> (k,v) -> b) -> b -> GiST m vec set k v -> m b
 foldli' f b = runIdentityT . foldliM' (cronk f) b
+
+foldlv' :: (Monad m, Vector vec (k,v)) => (b -> vec (k,v) -> b) -> b -> GiST m vec set k v -> m b
+foldlv' f b = runIdentityT . foldlvM' (cronk f) b
 
 -- sum :: (Num a, Monad f, Vector vec (key, a)) => GiST f vec set key a -> f a
 -- sum  = runIdentityT . foldl' (\a b -> return (a + b)) 0

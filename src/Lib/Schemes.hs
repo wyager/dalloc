@@ -101,7 +101,6 @@ instance (Functor f, Functor (g n)) => Functor (ComposeI f g n) where
 swozzle :: Functor f => (forall m b . g m b -> h m b) -> ComposeI f g n a -> ComposeI f h n a
 swozzle q (ComposeI f) = ComposeI (fmap q f)
 
-
 type Lift c f = (forall s . c s => c (f s) :: Constraint)
 
 

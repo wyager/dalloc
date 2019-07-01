@@ -52,6 +52,7 @@ default-extensions:
 - ConstraintKinds
 - DeriveTraversable
 - BangPatterns
+- DefaultSignatures
 
 dependencies:
 - base >= 4.7 && < 5
