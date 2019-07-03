@@ -2,7 +2,7 @@
 module Lib.Data where
 
 
-import           Lib.GiSTf (Lift)
+import           Lib.Schemes (Lift)
 import           Lib.System (ByteSemantics, semanticIsRoot, semanticChildren, IsRoot(NotRoot,YesRoot), NoParse(..), Ref)
 import           Data.ByteString (ByteString)
 import           Data.Map.Strict (Map)

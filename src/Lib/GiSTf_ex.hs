@@ -1,14 +1,19 @@
 module Lib.GiSTf_ex where
 
-import           Lib.GiSTf as G
+import qualified Lib.GiSTf2 as G
 import           Data.Vector.Unboxed (Vector)
 import           Data.Functor.Identity (Identity, runIdentity)
+import qualified Streaming.Prelude as SP
 
 
 
-e :: GiST Identity Vector (Within Int) Int Char
+e :: G.GiST Identity Vector (G.Within Int) Int Char
 e = G.empty
 
 
-f :: GiST Identity Vector (Within Int) Int Char
-f = foldl (\g (k,v) -> runIdentity $ runIdentity $ insert (FillFactor 4 8) k v g) e (take 20 $ zip [1..] ['a'..])
+f :: G.GiST Identity Vector (G.Within Int) Int Char
+f = foldl (\g (k,v) -> runIdentity $ G.insert (G.FillFactor 4 8) k v g) e (zip [1..] (['A'..'Z'] ++ ['a'..'z']))
+
+
+s :: SP.Stream (SP.Of Char) Identity ()
+s = G.foldlM' (const SP.yield) () f

@@ -236,47 +236,40 @@ instance R Identity Identity where
 
 
 
-idSaveS :: Saver Identity Identity (GiSTr vec set k v ('S h') (FixN h' (ComposeI Identity (GiSTr vec set k v))))
-idSaveS = Identity . Identity
-
-idSaveZ :: Saver Identity Identity (GiSTr vec set k v 'Z Void)
-idSaveZ = Identity . Identity
-
-idLeaveS :: GiSTn Identity vec set k v h' -> Identity (GiSTn Identity vec set k v h')
-idLeaveS = Identity
-
-idInsert' :: IsGiST vec set k v => FillFactor -> k -> v -> GiSTn Identity vec set k v h -> Either ((GiSTn Identity vec set k v h)) ((GiSTn Identity vec set k v ('S h)))
-idInsert' ff k v = runIdentity . insert' idSaveS idSaveZ idLeaveS ff k v
-
-idInsert :: IsGiST vec set k v => FillFactor -> k -> v -> GiST Identity vec set k v -> GiST Identity vec set k v
-idInsert ff k v (GiST g) = either GiST GiST (idInsert' ff k v g)
 
 
-insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v)  
-       => (forall h' . Saver m w (GiSTr vec set k v ('S h') (FixN h' (ComposeI w (GiSTr vec set k v)))))
-       -> Saver m w (GiSTr vec set k v 'Z Void)
-       -> (forall h' . GiSTn r vec set k v h' -> m (GiSTn w vec set k v h'))
-       -> FillFactor -> k -> v 
+type Saver m w x = x -> m (w x)
+
+class BackingStore m r w vec set k v | m -> r w where
+    saveS :: forall h . Saver m w (GiSTr vec set k v ('S h) (FixN h (ComposeI w (GiSTr vec set k v))))
+    saveZ :: Saver m w (GiSTr vec set k v 'Z Void)
+    leaveS :: forall h . GiSTn r vec set k v h -> m (GiSTn w vec set k v h)
+
+instance BackingStore Identity Identity Identity vec set k v where
+    saveS = Identity . Identity
+    saveZ = Identity . Identity
+    leaveS = Identity
+
+insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
+       =>
+       FillFactor -> k -> v 
        -> GiSTn r vec set k v h
        -> m (Either ((GiSTn w vec set k v h)) ((GiSTn w vec set k v ('S h))))
-insert' saveS saveZ leaveS ff k v g= insertAndSplit @m @r @w saveS saveZ leaveS ff k v g >>= \case
+insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
             One (_set, gist) -> return $ Left gist
             Two (aSet, GiSTn aGiSTn) (bSet, GiSTn bGiSTn) -> fmap (Right . GiSTn . FixN . ComposeI) $ saveS node 
                 where
                 node =  Node $ V.fromList [(aSet, aGiSTn), (bSet, bGiSTn)]
 
-type Saver m w x = x -> m (w x)
+
 
 insertAndSplit :: forall m r w vec set k v h
-               . (Monad m, R m r, IsGiST vec set k v) 
-               => (forall h' . Saver m w (GiSTr vec set k v ('S h') (FixN h' (ComposeI w (GiSTr vec set k v)))))
-               -> Saver m w (GiSTr vec set k v 'Z Void)
-               -> (forall h' . GiSTn r vec set k v h' -> m (GiSTn w vec set k v h'))
-               -> FillFactor
+               . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
+               => FillFactor
                -> k -> v
                ->          GiSTn r vec set k v h    
                -> m (AFew (set, (GiSTn w vec set k v h))) -- That which has been saved
-insertAndSplit saveS saveZ leaveS ff@FillFactor{..} key value = go 
+insertAndSplit ff@FillFactor{..} key value = go 
     where
     go :: forall h' . GiSTn r vec set k v h' -> m (AFew (set, GiSTn w vec set k v h'))
     go (GiSTn (FixZ (ComposeI (free))))  = do
@@ -445,6 +438,9 @@ foldlv' f b = runIdentityT . foldlvM' (cronk f) b
 
 empty :: forall f vec set key value . (IsGiST vec set key value, Applicative f) => GiST f vec set key value
 empty = GiST $ GiSTn $ FixZ $ ComposeI $ pure $ Leaf Vec.empty
+
+insert :: (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
+insert ff k v (GiST g) = either GiST GiST <$> (insert' ff k v g)
 
 -- list :: (Monad f, IsGiST vec set key value) => set -> GiST f vec set key value -> f (vec (key,value))
 -- list set (GiST g) = list' set g
