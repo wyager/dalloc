@@ -8,7 +8,7 @@ module Lib.GiSTf2 where
 import Prelude hiding (read)
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector, fromList)-- , fromList)
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import qualified Data.Vector.Generic as Vec (foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
 import Data.Semigroup (Min(Min,getMin))
@@ -22,6 +22,7 @@ import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldr
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
+import Data.Foldable (fold)
 
 -- import qualified Lib.Schemes as S
 
@@ -233,6 +234,24 @@ class R m r | m -> r where
 instance R Identity Identity where
     read = id
 
+
+
+idSaveS :: Saver Identity Identity (GiSTr vec set k v ('S h') (FixN h' (ComposeI Identity (GiSTr vec set k v))))
+idSaveS = Identity . Identity
+
+idSaveZ :: Saver Identity Identity (GiSTr vec set k v 'Z Void)
+idSaveZ = Identity . Identity
+
+idLeaveS :: GiSTn Identity vec set k v h' -> Identity (GiSTn Identity vec set k v h')
+idLeaveS = Identity
+
+idInsert' :: IsGiST vec set k v => FillFactor -> k -> v -> GiSTn Identity vec set k v h -> Either ((GiSTn Identity vec set k v h)) ((GiSTn Identity vec set k v ('S h)))
+idInsert' ff k v = runIdentity . insert' idSaveS idSaveZ idLeaveS ff k v
+
+idInsert :: IsGiST vec set k v => FillFactor -> k -> v -> GiST Identity vec set k v -> GiST Identity vec set k v
+idInsert ff k v (GiST g) = either GiST GiST (idInsert' ff k v g)
+
+
 insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v)  
        => (forall h' . Saver m w (GiSTr vec set k v ('S h') (FixN h' (ComposeI w (GiSTr vec set k v)))))
        -> Saver m w (GiSTr vec set k v 'Z Void)
@@ -266,7 +285,7 @@ insertAndSplit saveS saveZ leaveS ff@FillFactor{..} key value = go
             newVecs = insertKey (Proxy @set) ff key value vec  
             setOf = unions . map (exactly . fst) . Vec.toList 
             save = fmap (GiSTn . FixZ . ComposeI) . saveZ . Leaf
-        traverse (\children -> (setOf children :: set, ) <$> save children) newVecs    
+        traverse (\entries -> (setOf entries :: set, ) <$> save entries) newVecs    
     go (GiSTn (FixN (ComposeI (free))))  = do
         node <- read @m @r free 
         let vec = case node of Node v -> v
@@ -322,43 +341,43 @@ instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (
 
 
 
--- data Within a = Within {withinLo :: a, withinHi :: a} | Empty deriving (Eq, Ord, Show)
--- instance Ord a => Semigroup (Within a) where
---     (Within l1 h1) <> (Within l2 h2) = Within (min l1 l2) (max h1 h2)
---     Empty <> a = a
---     a <> Empty = a
--- instance Ord a => Monoid (Within a) where
---     mempty = Empty
+data Within a = Within {withinLo :: a, withinHi :: a} | Empty deriving (Eq, Ord, Show)
+instance Ord a => Semigroup (Within a) where
+    (Within l1 h1) <> (Within l2 h2) = Within (min l1 l2) (max h1 h2)
+    Empty <> a = a
+    a <> Empty = a
+instance Ord a => Monoid (Within a) where
+    mempty = Empty
 
--- class Sized f where
---     size :: Num a => f a -> a
+class Sized f where
+    size :: Num a => f a -> a
 
--- instance Sized Within where
---     size (Within l h) = h - l
---     size Empty = 0
+instance Sized Within where
+    size (Within l h) = h - l
+    size Empty = 0
 
--- instance (Ord a, Num a) => Key a (Within a) where
---     type Penalty (Within a) = a
---     exactly a = Within a a
---     overlaps (Within l1 h1) (Within l2 h2) = l1 <= h2 && l2 <= h1
---     overlaps Empty _ = False
---     overlaps _ Empty = False
---     unions = fold
---     penalty old new = size (old <> new) - size old
---     insertKey _ ff k v vec = 
---         if Vec.length new <= maxFill ff
---             then One new
---             else let (l,r) = Vec.splitAt (Vec.length new `div` 2) new in Two l r
---         where
---         (before,after) = Vec.span ((<= k) . fst) vec
---         new = Vec.concat [before, Vec.singleton (k,v), after]
---     partitionSets ff vec i (V2 l r) =
---         let (before, after') = Vec.splitAt i vec in
---         let after = Vec.tail after' in
---         let new = Vec.concat [before, Vec.fromList [l,r], after] in
---         if Vec.length new <= maxFill ff
---             then One new
---             else let (lo,hi) = Vec.splitAt (Vec.length new `div` 2) new in Two lo hi
+instance (Ord a, Num a) => Key a (Within a) where
+    type Penalty (Within a) = a
+    exactly a = Within a a
+    overlaps (Within l1 h1) (Within l2 h2) = l1 <= h2 && l2 <= h1
+    overlaps Empty _ = False
+    overlaps _ Empty = False
+    unions = fold
+    penalty old new = size (old <> new) - size old
+    insertKey _ ff k v vec = 
+        if Vec.length new <= maxFill ff
+            then One new
+            else let (l,r) = Vec.splitAt (Vec.length new `div` 2) new in Two l r
+        where
+        (before,after) = Vec.span ((<= k) . fst) vec
+        new = Vec.concat [before, Vec.singleton (k,v), after]
+    partitionSets ff vec i (V2 l r) =
+        let (before, after') = Vec.splitAt i vec in
+        let after = Vec.tail after' in
+        let new = Vec.concat [before, Vec.fromList [l,r], after] in
+        if Vec.length new <= maxFill ff
+            then One new
+            else let (lo,hi) = Vec.splitAt (Vec.length new `div` 2) new in Two lo hi
             
 
 
@@ -424,8 +443,8 @@ foldlv' f b = runIdentityT . foldlvM' (cronk f) b
 --        -> GiST read vec set key value -> read (write (GiST write vec set key value))
 -- insert ff k v (GiST g) = fmap (fmap (either GiST GiST)) $ insert' ff k v g
 
--- empty :: IsGiST vec set key value => GiST f vec set key value
--- empty = GiST (GiSTn (Pure Vec.empty))
+empty :: forall f vec set key value . (IsGiST vec set key value, Applicative f) => GiST f vec set key value
+empty = GiST $ GiSTn $ FixZ $ ComposeI $ pure $ Leaf Vec.empty
 
 -- list :: (Monad f, IsGiST vec set key value) => set -> GiST f vec set key value -> f (vec (key,value))
 -- list set (GiST g) = list' set g
