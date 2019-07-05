@@ -7,10 +7,12 @@ import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, w
 import           Data.Void (Void, absurd)
 import           Data.Proxy (Proxy(..))
 import           Data.Functor.Identity (Identity, runIdentity)
+import           Control.Monad (foldM)
 import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 
 import           Control.Concurrent.Classy (MonadConc)
-import           Data.Map.Strict as Map (Map, (!?), member, insert, insertWith, alterF, keys, empty, alter, updateLookupWithKey, adjust, delete, lookup, singleton, traverseWithKey, elemAt)
+import           Data.Map.Strict as Map (Map, (!?), member)
+import qualified Data.Map.Strict as Map
 import           Data.ByteString.Builder (Builder, byteString, hPutBuilder, toLazyByteString)
 import           Data.ByteString (ByteString)
 import qualified Data.ByteString as ByteString
@@ -28,6 +30,7 @@ import           Data.List (sortOn)
 import qualified Data.Vector as V
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Generic as VG
 
 import           Data.Word (Word8, Word64)
 
@@ -108,5 +111,23 @@ instance Q.Arbitrary G.FillFactor where
         return (G.FillFactor min max)
 
 testMapEquivalence :: forall vec key val proxy . (G.IsGiST vec (G.Within key) key val, Eq val, Eq (vec (key,val))) => proxy vec -> G.FillFactor -> [(key,val)] -> Bool
-testMapEquivalence _ fill assocs = runIdentity $ Gex.testMapEquivalence (Proxy :: Proxy (G.GiST Identity vec (G.Within key) key val)) fill assocs
+testMapEquivalence _ fill assocs = runIdentity $ go (Proxy :: Proxy (G.GiST Identity vec (G.Within key) key val)) fill assocs
+    where
+    go :: forall vec set k v m rw proxy . (G.IsGiST vec set k v, G.BackingStore m rw rw vec set k v, Monad m, G.R m rw, Eq (vec (k,v)), Ord k, Eq v) => proxy (G.GiST rw vec set k v) -> G.FillFactor -> [(k,v)]-> m Bool
+    go _ ff assocs = do
+            theGiST <- create 
+            (&&) <$> accessEquivalence theGiST <*> foldEquivalence theGiST
+        where
+        theMap = Map.fromList assocs
+        elems = Map.toList theMap -- deduplicated
+        create = G.empty >>= \empty -> foldM (\g (k,v) -> G.insert @vec @set ff k v g) empty  elems
+        -- create = Map.foldlWithKey (\g k v -> g >>= G.insert ff k v) (return G.empty) theMap
+        accessEquivalence g = and <$> mapM (testAccess g) elems
+        testAccess g (k,v) = do
+            matching <- G.list (G.exactly k) g
+            return $ matching == VG.singleton (k,v)
+        foldEquivalence gist = do
+            gistList <- G.foldr G.read (:) [] gist
+            gistListK <- G.foldri G.read (:) [] gist
+            return (gistListK == Map.toList theMap && gistList == Map.elems theMap)
 
