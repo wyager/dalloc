@@ -8,11 +8,6 @@ import Control.Monad.Trans.Reader (ReaderT(..))
 import Data.Void (Void, absurd, vacuous)
 import GHC.Exts (Constraint)
 
-
-
-
-
-
 newtype MFoldR a b t (m :: * -> *) r = MFoldR {runMFoldR :: (a -> b -> t m b) -> b -> t m r }
     deriving (Functor, Applicative, Monad) via ReaderT (a -> b -> t m b) (ReaderT b (t m)) 
 
@@ -39,11 +34,6 @@ class FoldFix (g :: * -> * -> *) where
            => forall m . Monad m 
            => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
            -> (b -> a -> t m b) -> b -> g a z -> t m b
-
-
-
-
-
 
 {-# INLINE unstack #-}
 unstack :: forall t m a g  . ()
@@ -98,50 +88,42 @@ newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = Compo
 instance (Functor f, Functor (g n)) => Functor (ComposeI f g n) where
   fmap q (ComposeI f) = ComposeI $ fmap (fmap q) f
 
-swozzle :: Functor f => (forall m b . g m b -> h m b) -> ComposeI f g n a -> ComposeI f h n a
-swozzle q (ComposeI f) = ComposeI (fmap q f)
 
 type Lift c f = (forall s . c s => c (f s) :: Constraint)
 
-
-hoistNL :: (forall n . Functor (f n)) => (forall n a . f n a -> g n a) -> FixN m f -> FixN m g
-hoistNL t (FixZ f) = FixZ (t f)
-hoistNL t (FixN f) = FixN (t (fmap (hoistNL t) f))
-
-hoistNR :: (forall n . Functor (g n)) => (forall n a . f n a -> g n a) -> FixN m f -> FixN m g
-hoistNR t (FixZ f) = FixZ (t f)
-hoistNR t (FixN f) = FixN (fmap (hoistNR t) (t f))
 
 
 cataNM :: (forall n' . Traversable (f n'), Monad m) => (forall n' . f n' a -> m a) -> FixN n f -> m a
 cataNM g (FixZ f) = g (vacuous f)
 cataNM g (FixN f) = g =<< (traverse (cataNM g) f)
 
+
 {-# INLINE unstackI #-}
-unstackI :: forall t m a g i  . ()
+unstackI :: forall t m a g i r . ()
         => Monad m 
         => (forall n . Monad n => Monad (t n))
         => MonadTrans t
-        => (forall n z j . Monad n => (z -> t n a) -> g j z -> t n a)
-        -> FixN i (ComposeI m g) -> t m a
-unstackI f = go
+        => (forall x . r x -> m x)
+        -> (forall n z j . Monad n => (z -> t n a) -> g j z -> t n a)
+        -> FixN i (ComposeI r g) -> t m a
+unstackI r2m f = go
     where
-    go :: forall j . FixN j (ComposeI m g) -> t m a
-    go (FixZ (ComposeI mg)) = f absurd =<< lift mg
-    go (FixN (ComposeI mg)) = f go     =<< lift mg
-
+    go :: forall j . FixN j (ComposeI r g) -> t m a
+    go (FixZ (ComposeI rg)) = f absurd =<<(lift (r2m rg))
+    go (FixN (ComposeI rg)) = f go     =<<(lift (r2m rg))
 
 
 {-# INLINEABLE rfoldri #-}
-rfoldri :: forall a b g m t j . (FoldFixI g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (a -> b -> t m b) -> b -> FixN j (ComposeI m (g a)) -> t m b
-rfoldri f b0 g = runMFoldR (unstackI step g) f b0
+rfoldri :: forall a b g h m t j r . (FoldFixI h, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (forall x . r x -> m x) -> (forall i x . g i x -> h a i x) -> (a -> b -> t m b) -> b -> FixN j (ComposeI r g) -> t m b
+rfoldri r2m g2h f b0 g = runMFoldR (unstackI r2m step g) f b0
   where
-  step :: forall z n j' . Monad n => (z -> MFoldR a b t n b) -> g a j' z -> MFoldR a b t n b
-  step zf gaz = MFoldR $ \abt b -> rfoldri_ (\abt' b' z -> runMFoldR (zf z) abt' b') abt b gaz
+  step :: forall z n j' . Monad n => (z -> MFoldR a b t n b) -> g j' z -> MFoldR a b t n b
+  step zf gaz = MFoldR $ \abt b -> rfoldri_ (\abt' b' z -> runMFoldR (zf z) abt' b') abt b (g2h gaz) -- Try writing a version that unwraps z
+
 
 {-# INLINEABLE rfoldli' #-}
-rfoldli' :: forall a b g m t j . (FoldFixI g, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> a -> t m b) -> b -> FixN j (ComposeI m (g a)) -> t m b
-rfoldli' f b0 g = runMFoldL (unstackI step g) f b0
+rfoldli' :: forall a b g h m t j r . (FoldFixI h, Monad m, MonadTrans t, (forall n . Monad n => Monad (t n))) => (forall x . r x -> m x) -> (forall i x . g i x -> h a i x) -> (b -> a -> t m b) -> b -> FixN j (ComposeI r g) -> t m b
+rfoldli' r2m g2h f b0 g = runMFoldL (unstackI r2m step g) f b0
   where
-  step :: forall z n j' . Monad n => (z -> MFoldL a b t n b) -> g a j' z -> MFoldL a b t n b
-  step zf gaz = MFoldL $ \bat b -> rfoldli'_ (\bat' b' z -> runMFoldL (zf z) bat' b') bat b gaz
+  step :: forall z n j' . Monad n => (z -> MFoldL a b t n b) -> g j' z -> MFoldL a b t n b
+  step zf gaz = MFoldL $ \bat b -> rfoldli'_ (\bat' b' z -> runMFoldL (zf z) bat' b') bat b (g2h gaz)

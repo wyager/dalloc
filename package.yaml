@@ -140,3 +140,4 @@ tests:
     - tasty-quickcheck
     - tasty-dejafu
     - dejafu
+    - vector

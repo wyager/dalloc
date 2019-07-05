@@ -5,6 +5,8 @@ import           System.Random (RandomGen, randomR, random, newStdGen, randomRs)
 import qualified Crypto.Random as Random
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
 import           Data.Void (Void, absurd)
+import           Data.Proxy (Proxy(..))
+import           Data.Functor.Identity (Identity, runIdentity)
 import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 
 import           Control.Concurrent.Classy (MonadConc)
@@ -19,10 +21,27 @@ import           Test.Tasty.QuickCheck (testProperty)
 import           Test.Tasty (defaultMain, testGroup)
 import           Test.DejaFu (deadlocksNever, exceptionsNever)
 
+import           Test.QuickCheck as Q
+
+import           Data.List (sortOn)
+
+import qualified Data.Vector as V
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Storable as VS
+
+import           Data.Word (Word8, Word64)
+
+import qualified Lib.GiSTf2 as G
+import qualified Lib.GiSTf_ex as Gex
+
 
 main :: IO ()
 main = defaultMain $ testGroup "All tests" $ 
-    [ testProperty "Writing then reading works as expected" (ioProperty . readsFollowWrites)
+    [ testProperty "GiST over Identity has equivalent behavior to a map (U/I/C)" (testMapEquivalence @VU.Vector @Int @Char Proxy)
+    , testProperty "GiST over Identity has equivalent behavior to a map (U/8/I)" (testMapEquivalence @VU.Vector @Word8 @Int Proxy)
+    , testProperty "GiST over Identity has equivalent behavior to a map (U/I/I)" (testMapEquivalence @VU.Vector @Int @Int Proxy)
+    , testProperty "GiST over Identity has equivalent behavior to a map (V/64/S)" (testMapEquivalence @V.Vector @Word64 @String Proxy)
+    , testProperty "Writing then reading works as expected" (ioProperty . readsFollowWrites)
     , testDejafus [("No deadlocks", deadlocksNever), ("No exceptions", exceptionsNever)] demoMock
     ]
 
@@ -81,3 +100,13 @@ readEqualsWrite g state = do
     readAll2 <- mapM (`readViaReadCache` rc) refs 
     readByteStrings2 <- mapM wait readAll2
     return (byteStrings == readByteStrings1 && readByteStrings1 == readByteStrings2)
+
+instance Q.Arbitrary G.FillFactor where
+    arbitrary = do
+        min <- choose (1,20)
+        max <- (min +) <$> choose (1,20)
+        return (G.FillFactor min max)
+
+testMapEquivalence :: forall vec key val proxy . (G.IsGiST vec (G.Within key) key val, Eq val, Eq (vec (key,val))) => proxy vec -> G.FillFactor -> [(key,val)] -> Bool
+testMapEquivalence _ fill assocs = runIdentity $ Gex.testMapEquivalence (Proxy :: Proxy (G.GiST Identity vec (G.Within key) key val)) fill assocs
+

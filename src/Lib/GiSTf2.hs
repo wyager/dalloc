@@ -8,6 +8,8 @@ module Lib.GiSTf2 where
 import Prelude hiding (read)
 -- import GHC.TypeLits (Nat, type (+))
 import qualified Data.Vector as V (Vector, fromList)-- , fromList)
+import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Storable as VS
 import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import qualified Data.Vector.Generic as Vec (foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import Data.Monoid (Endo(..))
@@ -17,16 +19,14 @@ import qualified Data.Foldable as Foldable (foldrM, foldlM)
 import Data.Functor.Compose (Compose)
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
-import qualified Data.Vector.Unboxed as U
-import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri, hoistNL, swozzle)
+
+-- import qualified Data.Vector.Unboxed as U
+import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
 import Data.Foldable (fold)
 
--- import qualified Lib.Schemes as S
-
--- data Nat = Z | S Nat
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -39,41 +39,23 @@ instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
     show (FixZ f) = show f
     show (FixN f) = show f
 
--- data FixN n f where
---     FixZ :: f  'Z     Void      -> FixN  'Z     f
---     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
-
--- type LiftI c f = (forall n s . c s => c (f n s) :: Constraint)
-
-
-
-
-
-
--- class FoldFixI (g :: * -> Nat -> * -> *) where
---     rfoldri_ :: forall t a b j . () 
---            => (forall m . Monad m => Monad (t m)) 
---            => MonadTrans t
---            => forall m . Monad m 
---            => forall z . ((a -> b -> t m b) -> b -> z -> t m b)
---            -> (a -> b -> t m b) -> b -> g a j z -> t m b
---     rfoldli'_ :: forall a b t j . () 
---            => (forall m . Monad m => Monad (t m)) 
---            => MonadTrans t
---            => forall m . Monad m 
---            => forall z . ((b -> a -> t m b) -> b -> z -> t m b)
---            -> (b -> a -> t m b) -> b -> g a j z -> t m b
-
-
 data FoldWithoutKey vec set key value n rec where
     FoldWithoutKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithoutKey vec set key value n rec
+
+instance Functor (FoldWithoutKey vec set key value n) where
+    fmap f (FoldWithoutKey g) = FoldWithoutKey (fmap f g)
 
 data FoldWithKey vec set kv n rec where
     FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithKey vec set kv n rec
 
+instance Functor (FoldWithKey vec set kv n) where
+    fmap f (FoldWithKey g) = FoldWithKey (fmap f g)
 
 data FoldWithVec set vec_kv n rec where
     FoldWithVec :: (Vector vec kv, vec_kv ~ vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithVec set vec_kv n rec
+
+instance Functor (FoldWithVec set vec_kv n) where
+    fmap f (FoldWithVec g) = FoldWithVec (fmap f g)
 
 
 instance FoldFixI (FoldWithoutKey vec set key) where
@@ -144,9 +126,7 @@ instance (Show set, Show (vec (key, value)), Lift Show f) => Show (GiSTn f vec s
     show (GiSTn x) = show x
 
 
-
-
-data FillFactor = FillFactor {minFill :: Int, maxFill :: Int}
+data FillFactor = FillFactor {minFill :: Int, maxFill :: Int} deriving Show
 
 class Ord (Penalty set) => Key key set | set -> key where
     type Penalty set :: *
@@ -161,14 +141,10 @@ class Ord (Penalty set) => Key key set | set -> key where
 
 
 class (Vector vec (key,value), Key key set) => IsGiST vec set key value 
-instance (U.Unbox key, U.Unbox value, Key key set) => IsGiST U.Vector set key value
+instance (VU.Unbox key, VU.Unbox value, Key key set) => IsGiST VU.Vector set key value
+instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key value
+instance Key key set => IsGiST V.Vector set key value
 
-
--- GiSTn f vec set key value n
-
--- data FixN n f where
---     FixZ :: f  'Z     Void      -> FixN  'Z     f
---     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
 
 preds :: (IsGiST vec set key value, Functor f) => GiSTn f vec set key value n -> f [set]
 preds (GiSTn fix) = case fix of 
@@ -177,22 +153,22 @@ preds (GiSTn fix) = case fix of
 
 
 
-search' :: forall vec height f set key value m 
-        . (IsGiST vec set key value, Monoid m, Monad f) 
-        => (vec (key,value) -> f m) -- You can either use the monoid m or the monad f to get the result out.
+search' :: forall vec height m set key value q r
+        . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
+        => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
         -> set 
-        -> GiSTn f vec set key value height
-        -> f m
+        -> GiSTn r vec set key value height
+        -> m q
 search' embed predicate = go
     where
-    go :: forall height' . GiSTn f vec set key value height' -> f m
+    go :: forall height' . GiSTn r vec set key value height' -> m q
     go (GiSTn fix) = case fix of
         FixZ (ComposeI g) -> do
-            q <- g
+            q <- read g
             case q of
                 Leaf vec -> embed (Vec.filter (overlaps predicate . exactly . fst) vec)
         FixN (ComposeI g) -> do
-            q <- g
+            q <- read g
             case q of
                 Node vec -> do
                     let f acc (subpred, subgist) = if overlaps predicate subpred 
@@ -216,16 +192,8 @@ dog :: Cat a -> [a]
 dog (Cat f) = f []
 
 -- Todo: Implement streaming search by lifting f to a Stream
-list' :: (IsGiST vec set key value, Monad f) => set -> GiSTn f vec set key value height -> f (vec (key,value))
+list' :: (IsGiST vec set key value, Monad m, R m f) => set -> GiSTn f vec set key value height -> m (vec (key,value))
 list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
-
-
--- -- contains set == not . null . search set
--- -- To actually optimize this properly, I need to provide a primitive like
--- -- m -> f m -> f m, which can short-circuit evaluation of the latter.
--- contains :: IsGist vn vl set key value => set -> GiST vn vl n set key value -> Bool
--- contains predicate = getAny . search' (const (Any True)) predicate
-
 
 
 class R m r | m -> r where
@@ -233,10 +201,6 @@ class R m r | m -> r where
 
 instance R Identity Identity where
     read = id
-
-
-
-
 
 type Saver m w x = x -> m (w x)
 
@@ -260,8 +224,6 @@ insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
             Two (aSet, GiSTn aGiSTn) (bSet, GiSTn bGiSTn) -> fmap (Right . GiSTn . FixN . ComposeI) $ saveS node 
                 where
                 node =  Node $ V.fromList [(aSet, aGiSTn), (bSet, bGiSTn)]
-
-
 
 insertAndSplit :: forall m r w vec set k v h
                . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
@@ -381,69 +343,67 @@ data GiST f vec set key value where
 instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
     show (GiST g) = show g
 
-foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (v -> b -> t m b) -> b -> GiST m vec set key v -> t m b
-foldrM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithoutKey) g
+
+-- TODO: This stuff all assumes the ref is a monad. Need to rewrite in terms of R.
+
+foldrM2 :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
+foldrM2 r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
+
+foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
+foldrM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
 
 
-foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => ((k,v) -> b -> t m b) -> b -> GiST m vec set k v -> t m b
-foldriM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithKey) g
+foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> ((k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
+foldriM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithKey f b g
 
 
-foldrvM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (vec (k,v) -> b -> t m b) -> b -> GiST m vec set k v -> t m b
-foldrvM f b (GiST (GiSTn g)) = rfoldri f b $ hoistNL (swozzle FoldWithVec) g
+foldrvM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (vec (k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
+foldrvM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithVec f b g
 
 
 
-foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> v -> t m b) -> b -> GiST m vec set key v -> t m b
-foldlM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithoutKey) g
+foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> v -> t m b) -> b -> GiST r vec set key v -> t m b
+foldlM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithoutKey f b g
 
-foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> (k,v) -> t m b) -> b -> GiST m vec set k v -> t m b
-foldliM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithKey) g
+foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
+foldliM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithKey f b g
 
-foldlvM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) => (b -> vec (k,v) -> t m b) -> b -> GiST m vec set k v -> t m b
-foldlvM' f b (GiST (GiSTn g)) = rfoldli' f b $ hoistNL (swozzle FoldWithVec) g
+foldlvM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> vec (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
+foldlvM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithVec f b g
 
 
 
 cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
 cronk f a b = return (f a b)
 
-foldr :: (Monad m, Vector vec (key,v)) => (v -> b -> b) -> b -> GiST m vec set key v -> m b
-foldr f b = runIdentityT . foldrM (cronk f) b 
+foldr :: (Monad m, Vector vec (key,v)) => (forall x . r x -> m x) -> (v -> b -> b) -> b -> GiST r vec set key v -> m b
+foldr r2m f b = runIdentityT . foldrM r2m (cronk f) b 
 
-foldri :: (Monad m, Vector vec (k,v)) => ((k,v) -> b -> b) -> b -> GiST m vec set k v -> m b
-foldri f b = runIdentityT . foldriM (cronk f) b 
+foldri :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> ((k,v) -> b -> b) -> b -> GiST r vec set k v -> m b
+foldri r2m f b = runIdentityT . foldriM r2m (cronk f) b 
 
-foldrv :: (Monad m, Vector vec (k,v)) => (vec (k,v) -> b -> b) -> b -> GiST m vec set k v -> m b
-foldrv f b = runIdentityT . foldrvM (cronk f) b 
-
-
-foldl' :: (Monad m, Vector vec (key,v)) => (b -> v -> b) -> b -> GiST m vec set key v -> m b
-foldl' f b = runIdentityT . foldlM' (cronk f) b 
-
-foldli' :: (Monad m, Vector vec (k,v)) => (b -> (k,v) -> b) -> b -> GiST m vec set k v -> m b
-foldli' f b = runIdentityT . foldliM' (cronk f) b
-
-foldlv' :: (Monad m, Vector vec (k,v)) => (b -> vec (k,v) -> b) -> b -> GiST m vec set k v -> m b
-foldlv' f b = runIdentityT . foldlvM' (cronk f) b
-
--- sum :: (Num a, Monad f, Vector vec (key, a)) => GiST f vec set key a -> f a
--- sum  = runIdentityT . foldl' (\a b -> return (a + b)) 0
+foldrv :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (vec (k,v) -> b -> b) -> b -> GiST r vec set k v -> m b
+foldrv r2m f b = runIdentityT . foldrvM r2m (cronk f) b 
 
 
--- insert :: (Monad read, Functor write, RW read write vec set key value)  
---        => FillFactor -> key -> value 
---        -> GiST read vec set key value -> read (write (GiST write vec set key value))
--- insert ff k v (GiST g) = fmap (fmap (either GiST GiST)) $ insert' ff k v g
+foldl' :: (Monad m, Vector vec (key,v)) => (forall x . r x -> m x) -> (b -> v -> b) -> b -> GiST r vec set key v -> m b
+foldl' r2m f b = runIdentityT . foldlM' r2m (cronk f) b 
 
-empty :: forall f vec set key value . (IsGiST vec set key value, Applicative f) => GiST f vec set key value
-empty = GiST $ GiSTn $ FixZ $ ComposeI $ pure $ Leaf Vec.empty
+foldli' :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (b -> (k,v) -> b) -> b -> GiST r vec set k v -> m b
+foldli' r2m f b = runIdentityT . foldliM' r2m (cronk f) b
 
-insert :: (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
+foldlv' :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (b -> vec (k,v) -> b) -> b -> GiST r vec set k v -> m b
+foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
+
+
+empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec set k v, Functor m) => m (GiST w vec set k v)
+empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
+
+insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v (GiST g) = either GiST GiST <$> (insert' ff k v g)
 
--- list :: (Monad f, IsGiST vec set key value) => set -> GiST f vec set key value -> f (vec (key,value))
--- list set (GiST g) = list' set g
+list :: (Monad m, IsGiST vec set key value, R m f) => set -> GiST f vec set key value -> m (vec (key,value))
+list set (GiST g) = list' set g
 
 
 
