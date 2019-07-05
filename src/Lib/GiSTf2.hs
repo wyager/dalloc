@@ -26,7 +26,7 @@ import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
 import Data.Foldable (fold)
-
+import Control.Monad.Trans.Class (lift)
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -179,6 +179,13 @@ search' embed predicate = go
                     Vec.foldM f mempty (vec)
 
 
+search :: forall vec m set key value q r
+        . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
+        => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
+        -> set 
+        -> GiST r vec set key value
+        -> m q 
+search e p (GiST g) = search' e p g
 
 
 newtype Cat a = Cat ([a] -> [a]) 
@@ -196,11 +203,18 @@ list' :: (IsGiST vec set key value, Monad m, R m f) => set -> GiSTn f vec set ke
 list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
 
 
-class R m r | m -> r where
+class R (m :: * -> *) r | m -> r where
     read :: r x -> m x
 
 instance R Identity Identity where
     read = id
+
+newtype Transforming t n a = Transforming {transformed :: t n a}
+    deriving newtype (Functor, Applicative, Monad, MonadTrans)
+
+instance (R m r, Monad m, MonadTrans t) => R (Transforming t m) r where
+    read r = Transforming $ lift $ read @m r
+
 
 type Saver m w x = x -> m (w x)
 
