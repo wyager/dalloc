@@ -37,16 +37,11 @@ import           Data.Word (Word8, Word64)
 import qualified Lib.GiST as G
 import qualified Lib.GiST_ex as Gex
 
-import qualified Criterion.Main as CM
+
 
 
 main :: IO ()
-main = do
-    tasty
-    criterion
-
-tasty :: IO ()
-tasty = defaultMain $ testGroup "All tests" $ 
+main = defaultMain $ testGroup "All tests" $ 
     [ testProperty "GiST over Identity has equivalent behavior to a map (U/I/C)" (testMapEquivalence @VU.Vector @Int @Char Proxy)
     , testProperty "GiST over Identity has equivalent behavior to a map (U/8/I)" (testMapEquivalence @VU.Vector @Word8 @Int Proxy)
     , testProperty "GiST over Identity has equivalent behavior to a map (U/I/I)" (testMapEquivalence @VU.Vector @Int @Int Proxy)
@@ -55,11 +50,6 @@ tasty = defaultMain $ testGroup "All tests" $
     , testDejafus [("No deadlocks", deadlocksNever), ("No exceptions", exceptionsNever)] demoMock
     ]
 
-criterion :: IO ()
-criterion = return ()
-    -- CM.defaultMain [
-    --     CM.bgroup "
-    -- ]
 
 -- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
 demoMock :: MonadConc m => m (Map FilePath ByteString)
@@ -136,8 +126,8 @@ testMapEquivalence _ fill assocs = runIdentity $ go (Proxy :: Proxy (G.GiST Iden
         create = G.empty >>= \empty -> foldM (\g (k,v) -> G.insert @vec @set ff k v g) empty  elems
         accessEquivalence g = and <$> mapM (testAccess g) elems
         testAccess g (k,v) = do
-            matching <- G.list (G.exactly k) g
-            return $ matching == VG.singleton (k,v)
+            matching <- Gex.toList (G.exactly k) g
+            return $ matching == [(k,v)]
         foldEquivalence gist = do
             gistList <- G.foldr G.read (:) [] gist
             gistListK <- G.foldri G.read (:) [] gist

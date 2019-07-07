@@ -3,6 +3,7 @@ module Lib.GiST_ex where
 import qualified Lib.GiST as G
 import           Data.Vector.Unboxed (Vector)
 import qualified Data.Vector.Unboxed as VU
+import qualified Data.Vector.Generic as VG
 import           Data.Functor.Identity (Identity, runIdentity)
 import qualified Streaming.Prelude as SP
 import           Data.Foldable (foldl')
@@ -41,4 +42,14 @@ speedFoldS :: G.GiST Identity Vector (G.Within Int) Int Int -> Int
 speedFoldS big = SP.fst' $ runIdentity $  SP.sum stream
     where
     stream :: SP.Stream (SP.Of Int) Identity () 
+    stream = G.foldlM' id (\() v -> SP.yield v) () big
+
+speedSearchS :: G.GiST Identity Vector (G.Within Int) Int Int -> Int
+speedSearchS big = SP.fst' $ runIdentity $  SP.sum stream
+    where
+    stream :: SP.Stream (SP.Of Int) Identity () 
     stream = G.transformed $ G.search (VU.foldM_ (\() (_k,v) -> G.Transforming $ SP.yield v) ()) (G.Within 0 maxBound) big 
+
+toList :: (G.IsGiST vec set k v, Monad m, G.R m r) => set -> G.GiST r vec set k v -> m [(k,v)]
+toList = G.search (return . VG.toList) 
+    

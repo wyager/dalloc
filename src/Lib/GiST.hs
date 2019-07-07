@@ -6,25 +6,24 @@
 module Lib.GiST where
 
 import Prelude hiding (read)
--- import GHC.TypeLits (Nat, type (+))
-import qualified Data.Vector as V (Vector, fromList)-- , fromList)
+import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
-import qualified Data.Vector.Generic as Vec (foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) 
+import qualified Data.Vector.Generic as Vec (foldr, foldl') 
 import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
--- import Control.Monad.Free (Free(Free,Pure))
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
-
--- import qualified Data.Vector.Unboxed as U
 import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
 import Data.Foldable (fold)
 import Control.Monad.Trans.Class (lift)
+
+import Control.DeepSeq (NFData, rnf)
+import GHC.Generics (Generic)
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -90,7 +89,14 @@ data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
     Node :: V.Vector (set, rec) -> GiSTr vec set key value ('S n) rec
 
+instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value n rec) where
+    rnf (Leaf v) = rnf v
+    rnf (Node v) = rnf v
+
 data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
+
+instance (forall a . NFData a => NFData (f a), NFData (vec (key,value)), NFData set) => NFData (GiSTn f vec set key value n) where
+    rnf (GiSTn g) = rnf g
 
 instance (Show set, Show rec, Show (vec (key, value))) => Show (GiSTr vec set key value n rec) where
     show (Leaf vec) = "(Leaf " ++ show vec ++ ")"
@@ -246,7 +252,10 @@ instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
 instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (unignored y)
 
 
-data Within a = Within {withinLo :: a, withinHi :: a} | Empty deriving (Eq, Ord, Show)
+data Within a = Within {withinLo :: a, withinHi :: a} | Empty 
+    deriving (Eq, Ord, Show, Generic)
+    deriving anyclass NFData
+
 instance Ord a => Semigroup (Within a) where
     (Within l1 h1) <> (Within l2 h2) = Within (min l1 l2) (max h1 h2)
     Empty <> a = a
@@ -290,11 +299,12 @@ instance (Ord a, Num a) => Key a (Within a) where
 data GiST f vec set key value where
     GiST :: GiSTn f vec set key value height -> GiST f vec set key value
 
+instance (NFData (vec (key,value)), NFData set, forall a . NFData a => NFData (f a)) => NFData (GiST f vec set key value) where
+    rnf (GiST g) = rnf g
+
 instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
     show (GiST g) = show g
 
-foldrM2 :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
-foldrM2 r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
 
 foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
 foldrM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g

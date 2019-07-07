@@ -1,3 +1,4 @@
+{-# LANGUAGE UndecidableInstances #-} -- for NFData FixN
 module Lib.Schemes where
 
 import Control.Monad.Trans.Class (MonadTrans, lift)
@@ -7,6 +8,7 @@ import Control.Monad ((<=<))
 import Control.Monad.Trans.Reader (ReaderT(..))
 import Data.Void (Void, absurd, vacuous)
 import GHC.Exts (Constraint)
+import Control.DeepSeq (NFData, rnf)
 
 newtype MFoldR a b t (m :: * -> *) r = MFoldR {runMFoldR :: (a -> b -> t m b) -> b -> t m r }
     deriving (Functor, Applicative, Monad) via ReaderT (a -> b -> t m b) (ReaderT b (t m)) 
@@ -83,7 +85,13 @@ data Nat = Z | S Nat
 data FixN n f where
     FixZ :: f  'Z     Void      -> FixN  'Z    f
     FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
+
+instance (forall j a . NFData a => NFData (f j a)) => NFData (FixN i f) where 
+  rnf (FixZ f) = rnf f
+  rnf (FixN f) = rnf f
+
 newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
+  deriving newtype NFData
 
 instance (Functor f, Functor (g n)) => Functor (ComposeI f g n) where
   fmap q (ComposeI f) = ComposeI $ fmap (fmap q) f
