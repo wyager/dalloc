@@ -25,9 +25,8 @@ s = G.foldlM' id (const SP.yield) () f
 s2 :: SP.Stream (SP.Of (Int,Char)) Identity () 
 s2 = G.transformed $ G.search (VU.foldM_ (\() (k,v) -> G.Transforming $ SP.yield (k,v)) ()) (G.Within 6 20) f
 
-
-bigSet :: Int -> G.GiST Identity Vector (G.Within Int) Int Int
-bigSet n = foldl' (\g k -> runIdentity $ G.insert (G.FillFactor 4 10) k k g) e ([1..n] :: [Int])
+bigSet :: G.FillFactor -> Int -> G.GiST Identity Vector (G.Within Int) Int Int
+bigSet ff n = foldl' (\g k -> runIdentity $ G.insert ff k k g) e ([1..n] :: [Int])
 
 force :: G.GiST Identity Vector (G.Within Int) Int Int -> Int
 force g = runIdentity $ G.foldli' id (\a (k,v) -> a + k + v) 0 g

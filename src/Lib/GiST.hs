@@ -125,11 +125,6 @@ instance (VU.Unbox key, VU.Unbox value, Key key set) => IsGiST VU.Vector set key
 instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key value
 instance Key key set => IsGiST V.Vector set key value
 
-preds :: (IsGiST vec set key value, Functor f) => GiSTn f vec set key value n -> f [set]
-preds (GiSTn fix) = case fix of 
-    FixZ (ComposeI fl) -> fmap (\(Leaf vec) -> map (exactly . fst) $ Vec.toList vec) fl
-    FixN (ComposeI fn) -> fmap (\(Node vec) -> map fst $ Vec.toList vec) fn
-
 search' :: forall vec height m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
@@ -207,14 +202,14 @@ insertAndSplit :: forall m r w vec set k v h
 insertAndSplit ff@FillFactor{..} key value = go 
     where
     go :: forall h' . GiSTn r vec set k v h' -> m (AFew (set, GiSTn w vec set k v h'))
-    go (GiSTn (FixZ (ComposeI (free))))  = do
+    go !(GiSTn (FixZ (ComposeI (free))))  = do
         vec <- read @m @r free >>= \case Leaf vec -> return vec
         let newVecs :: AFew (vec (k, v))
             newVecs = insertKey (Proxy @set) ff key value vec  
             setOf = unions . map (exactly . fst) . Vec.toList 
             save = fmap (GiSTn . FixZ . ComposeI) . saveZ . Leaf
         traverse (\entries -> (setOf entries :: set, ) <$> save entries) newVecs    
-    go (GiSTn (FixN (ComposeI (free))))  = do
+    go !(GiSTn (FixN (ComposeI (free))))  = do
         node <- read @m @r free 
         let vec = case node of Node v -> v
         case chooseSubtree node (exactly key) of
