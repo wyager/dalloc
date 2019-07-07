@@ -34,12 +34,19 @@ import qualified Data.Vector.Generic as VG
 
 import           Data.Word (Word8, Word64)
 
-import qualified Lib.GiSTf2 as G
-import qualified Lib.GiSTf_ex as Gex
+import qualified Lib.GiST as G
+import qualified Lib.GiST_ex as Gex
+
+import qualified Criterion.Main as CM
 
 
 main :: IO ()
-main = defaultMain $ testGroup "All tests" $ 
+main = do
+    tasty
+    criterion
+
+tasty :: IO ()
+tasty = defaultMain $ testGroup "All tests" $ 
     [ testProperty "GiST over Identity has equivalent behavior to a map (U/I/C)" (testMapEquivalence @VU.Vector @Int @Char Proxy)
     , testProperty "GiST over Identity has equivalent behavior to a map (U/8/I)" (testMapEquivalence @VU.Vector @Word8 @Int Proxy)
     , testProperty "GiST over Identity has equivalent behavior to a map (U/I/I)" (testMapEquivalence @VU.Vector @Int @Int Proxy)
@@ -47,6 +54,12 @@ main = defaultMain $ testGroup "All tests" $
     , testProperty "Writing then reading works as expected" (ioProperty . readsFollowWrites)
     , testDejafus [("No deadlocks", deadlocksNever), ("No exceptions", exceptionsNever)] demoMock
     ]
+
+criterion :: IO ()
+criterion = return ()
+    -- CM.defaultMain [
+    --     CM.bgroup "
+    -- ]
 
 -- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
 demoMock :: MonadConc m => m (Map FilePath ByteString)
@@ -121,7 +134,6 @@ testMapEquivalence _ fill assocs = runIdentity $ go (Proxy :: Proxy (G.GiST Iden
         theMap = Map.fromList assocs
         elems = Map.toList theMap -- deduplicated
         create = G.empty >>= \empty -> foldM (\g (k,v) -> G.insert @vec @set ff k v g) empty  elems
-        -- create = Map.foldlWithKey (\g k v -> g >>= G.insert ff k v) (return G.empty) theMap
         accessEquivalence g = and <$> mapM (testAccess g) elems
         testAccess g (k,v) = do
             matching <- G.list (G.exactly k) g

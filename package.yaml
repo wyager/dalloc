@@ -116,6 +116,8 @@ executables:
     - stm
     - async
     - dejafu
+    - time
+
     
 
 tests:
@@ -141,3 +143,4 @@ tests:
     - tasty-dejafu
     - dejafu
     - vector
+    - criterion

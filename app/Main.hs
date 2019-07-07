@@ -1,8 +1,30 @@
 module Main (main) where
 
 import qualified Lib.SchemeTest as ST
+import qualified Lib.GiST_ex as Ex
+import           Data.Time.Clock (getCurrentTime)
 
-main = ST.test2I 25
+main = do
+    let b = Ex.bigSet 200000
+    print =<< getCurrentTime
+    putStrLn "Forcing"
+
+    print $ Ex.force b
+    print =<< getCurrentTime
+    putStrLn "fold"
+
+    print $ Ex.speedFold b
+    print =<< getCurrentTime
+    putStrLn "vfold"
+
+
+    print $ Ex.speedFoldV b   
+    print =<< getCurrentTime
+    putStrLn "sfold"
+
+    print $ Ex.speedFoldS b
+    print =<< getCurrentTime
+    putStrLn "done"
 
 -- import Lib.System (demoIO)
 

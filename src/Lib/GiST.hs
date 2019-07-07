@@ -3,7 +3,7 @@
 {-# LANGUAGE UndecidableInstances #-} -- Show constraints
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Lib.GiSTf2 where
+module Lib.GiST where
 
 import Prelude hiding (read)
 -- import GHC.TypeLits (Nat, type (+))
@@ -12,11 +12,9 @@ import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
 import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
 import qualified Data.Vector.Generic as Vec (foldr, foldl') --, concat, filter, toList, imap, ifoldl, singleton, length, fromList, tail, splitAt, empty, foldM, span)
-import Data.Monoid (Endo(..))
 import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
 -- import Control.Monad.Free (Free(Free,Pure))
-import Data.Functor.Compose (Compose)
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
 
@@ -32,9 +30,6 @@ data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
 data V2 x = V2 x x
 
-type f ∘ g = Compose f g
-
-
 instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
     show (FixZ f) = show f
     show (FixN f) = show f
@@ -42,21 +37,11 @@ instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
 data FoldWithoutKey vec set key value n rec where
     FoldWithoutKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithoutKey vec set key value n rec
 
-instance Functor (FoldWithoutKey vec set key value n) where
-    fmap f (FoldWithoutKey g) = FoldWithoutKey (fmap f g)
-
 data FoldWithKey vec set kv n rec where
     FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithKey vec set kv n rec
 
-instance Functor (FoldWithKey vec set kv n) where
-    fmap f (FoldWithKey g) = FoldWithKey (fmap f g)
-
 data FoldWithVec set vec_kv n rec where
     FoldWithVec :: (Vector vec kv, vec_kv ~ vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithVec set vec_kv n rec
-
-instance Functor (FoldWithVec set vec_kv n) where
-    fmap f (FoldWithVec g) = FoldWithVec (fmap f g)
-
 
 instance FoldFixI (FoldWithoutKey vec set key) where
     {-# INLINEABLE rfoldri_ #-}
@@ -105,15 +90,7 @@ data GiSTr vec set key value n rec where
     Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
     Node :: V.Vector (set, rec) -> GiSTr vec set key value ('S n) rec
 
-instance Functor (GiSTr vec set k v n) where
-    fmap _ (Leaf v) = Leaf v
-    fmap f (Node v) = Node $ fmap (\(s,r) -> (s,f r)) v 
-
-
--- newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
-
 data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
-
 
 instance (Show set, Show rec, Show (vec (key, value))) => Show (GiSTr vec set key value n rec) where
     show (Leaf vec) = "(Leaf " ++ show vec ++ ")"
@@ -124,7 +101,6 @@ instance (Lift Show f, forall n' . Lift Show (g n'), Show a) => Show (ComposeI f
 
 instance (Show set, Show (vec (key, value)), Lift Show f) => Show (GiSTn f vec set key value n) where
     show (GiSTn x) = show x
-
 
 data FillFactor = FillFactor {minFill :: Int, maxFill :: Int} deriving Show
 
@@ -138,20 +114,15 @@ class Ord (Penalty set) => Key key set | set -> key where
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
     insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
 
-
-
 class (Vector vec (key,value), Key key set) => IsGiST vec set key value 
 instance (VU.Unbox key, VU.Unbox value, Key key set) => IsGiST VU.Vector set key value
 instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key value
 instance Key key set => IsGiST V.Vector set key value
 
-
 preds :: (IsGiST vec set key value, Functor f) => GiSTn f vec set key value n -> f [set]
 preds (GiSTn fix) = case fix of 
     FixZ (ComposeI fl) -> fmap (\(Leaf vec) -> map (exactly . fst) $ Vec.toList vec) fl
     FixN (ComposeI fn) -> fmap (\(Node vec) -> map fst $ Vec.toList vec) fn
-
-
 
 search' :: forall vec height m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
@@ -178,7 +149,6 @@ search' embed predicate = go
                         else return acc
                     Vec.foldM f mempty (vec)
 
-
 search :: forall vec m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
@@ -186,22 +156,6 @@ search :: forall vec m set key value q r
         -> GiST r vec set key value
         -> m q 
 search e p (GiST g) = search' e p g
-
-
-newtype Cat a = Cat ([a] -> [a]) 
-    deriving Semigroup via Endo [a]
-    deriving Monoid via Endo [a]
-
-cat :: a -> Cat a
-cat a = Cat (a:)
-
-dog :: Cat a -> [a]
-dog (Cat f) = f []
-
--- Todo: Implement streaming search by lifting f to a Stream
-list' :: (IsGiST vec set key value, Monad m, R m f) => set -> GiSTn f vec set key value height -> m (vec (key,value))
-list' predicate gist = Vec.concat . dog <$> search' (return . cat) predicate gist
-
 
 class R (m :: * -> *) r | m -> r where
     read :: r x -> m x
@@ -213,8 +167,7 @@ newtype Transforming t n a = Transforming {transformed :: t n a}
     deriving newtype (Functor, Applicative, Monad, MonadTrans)
 
 instance (R m r, Monad m, MonadTrans t) => R (Transforming t m) r where
-    read r = Transforming $ lift $ read @m r
-
+    read = Transforming . lift . read
 
 type Saver m w x = x -> m (w x)
 
@@ -288,26 +241,9 @@ chooseSubtree (Node vec) predicate = ignored . getMin <$> bestSubtree
     f ix (subpred, subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
 
 
-
-
--- class (IsGiST vec set key value) => RW read write vec set key value | write -> read where
---     saveLeaf :: vec (key, value) -> write (Rec 'Z           write vec set key value)
---     saveNode :: Node set (Either   (write (Rec height       write vec set key value)) 
---                                    (read  (Rec height       read  vec set key value))) 
---                                  -> write (Rec ('S height)  write vec set key value) -- Save node
-
--- instance IsGiST vec set key value => RW Identity Identity vec set key value where
---     saveLeaf = Identity . Pure
---     saveNode = Identity . Free . Compose . fmap (either id id)
-
-
-
-
 data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
 instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
 instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (unignored y)
-
-
 
 
 data Within a = Within {withinLo :: a, withinHi :: a} | Empty deriving (Eq, Ord, Show)
@@ -356,9 +292,6 @@ data GiST f vec set key value where
 
 instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
     show (GiST g) = show g
-
-
--- TODO: This stuff all assumes the ref is a monad. Need to rewrite in terms of R.
 
 foldrM2 :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
 foldrM2 r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
@@ -415,9 +348,6 @@ empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v (GiST g) = either GiST GiST <$> (insert' ff k v g)
-
-list :: (Monad m, IsGiST vec set key value, R m f) => set -> GiST f vec set key value -> m (vec (key,value))
-list set (GiST g) = list' set g
 
 
 
