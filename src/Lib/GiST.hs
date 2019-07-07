@@ -3,14 +3,19 @@
 {-# LANGUAGE UndecidableInstances #-} -- Show constraints
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Lib.GiST where
+module Lib.GiST (
+    GiST, Within(..), FillFactor(..), Transforming(..),
+    IsGiST, R,
+    empty, insert, search,
+    foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv'
+) where
 
-import Prelude hiding (read)
+import Prelude hiding (read, foldr)
 import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl, imapM, length, splitAt, span, singleton, tail, fromList, empty) 
-import qualified Data.Vector.Generic as Vec (foldr, foldl') 
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', imap, length, splitAt, span, singleton, tail, fromList) 
+import qualified Data.Vector.Generic as Vec (foldr, foldl', empty) 
 import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
 import Data.Proxy (Proxy(Proxy))
@@ -175,13 +180,16 @@ type Saver m w x = x -> m (w x)
 class BackingStore m r w vec set k v | m -> r w where
     saveS :: forall h . Saver m w (GiSTr vec set k v ('S h) (FixN h (ComposeI w (GiSTr vec set k v))))
     saveZ :: Saver m w (GiSTr vec set k v 'Z Void)
-    leaveS :: forall h . GiSTn r vec set k v h -> m (GiSTn w vec set k v h)
+    leaveS :: forall h proxy . proxy m -> GiSTn r vec set k v h -> GiSTn w vec set k v h
 
 instance BackingStore Identity Identity Identity vec set k v where
     saveS = Identity . Identity
     saveZ = Identity . Identity
-    leaveS = Identity
+    leaveS _ = id
 
+
+-- {-# SPECIALIZE insert' 
+{-# INLINABLE insert' #-}
 insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
        =>
        FillFactor -> k -> v 
@@ -193,6 +201,7 @@ insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
                 where
                 node =  Node $ V.fromList [(aSet, aGiSTn), (bSet, bGiSTn)]
 
+{-# INLINABLE insertAndSplit #-}
 insertAndSplit :: forall m r w vec set k v h
                . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
                => FillFactor
@@ -216,15 +225,15 @@ insertAndSplit ff@FillFactor{..} key value = go
             Nothing -> error "GiST node is empty, violating data structure invariants"
             Just (bestIx, best) -> do
                 inserted <- go (GiSTn best)
-                let reuse r = leaveS (GiSTn r) >>= \(GiSTn w) -> return w
+                let reuse r = let (GiSTn w) = leaveS (Proxy @m) (GiSTn r) in w
                 case inserted of
                     One (set, GiSTn gist) -> do
-                        vec' <- Vec.imapM (\i old -> if i == bestIx then return (set, gist) else traverse reuse old) vec
+                        let vec' = Vec.imap (\i old -> if i == bestIx then (set, gist) else fmap reuse old) vec
                         let set' = unions $ map fst $ Vec.toList vec'
                         saved <- saveS (Node vec')
                         return $ One (set', GiSTn $ FixN $ ComposeI saved)
                     Two (setL, GiSTn l) (setR, GiSTn r) -> do
-                        untouched <- mapM (traverse reuse) vec
+                        let untouched = fmap (fmap reuse) vec
                         let wrap vec' = do
                                 saved <- saveS (Node vec')
                                 return (unions (fmap fst vec'),GiSTn $ FixN $ ComposeI saved)
@@ -232,13 +241,14 @@ insertAndSplit ff@FillFactor{..} key value = go
                             One v -> One <$> wrap v
                             Two v1 v2 -> Two <$> wrap v1 <*> wrap v2
 
+{-# INLINE chooseSubtree #-}
 chooseSubtree :: forall vec set k v h x . (IsGiST vec set k v)
               => GiSTr vec set k v ('S h) x
               -> set 
               -> Maybe (Int, x)
 chooseSubtree (Node vec) predicate = ignored . getMin <$> bestSubtree
     where
-    bestSubtree = Vec.ifoldl (\best i next -> best <> f i next) Nothing vec
+    bestSubtree = Vec.ifoldl' (\best i next -> best <> f i next) Nothing vec
     f ix (subpred, subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
 
 
@@ -351,6 +361,8 @@ foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
 empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec set k v, Functor m) => m (GiST w vec set k v)
 empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 
+{-# SPECIALIZE insert :: FillFactor -> Int -> Int -> GiST Identity VU.Vector (Within Int) Int Int -> Identity (GiST Identity VU.Vector (Within Int) Int Int) #-}
+{-# INLINABLE insert #-}
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v (GiST g) = either GiST GiST <$> (insert' ff k v g)
 
