@@ -83,8 +83,8 @@ class FoldFixI (g :: * -> Nat -> * -> *) where
 
 data Nat = Z | S Nat
 data FixN n f where
-    FixZ :: f  'Z     Void      -> FixN  'Z    f
-    FixN :: f ('S n) (FixN n f) -> FixN ('S n) f
+    FixZ :: !(f  'Z     Void)      -> FixN  'Z    f
+    FixN :: !(f ('S n) (FixN n f)) -> FixN ('S n) f
 
 instance (forall j a . NFData a => NFData (f j a)) => NFData (FixN i f) where 
   rnf (FixZ f) = rnf f

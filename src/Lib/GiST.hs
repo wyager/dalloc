@@ -86,8 +86,8 @@ instance FoldFixI (FoldWithVec set) where
             go  acc (_set,subtree) = rec f acc subtree
 
 data GiSTr vec set key value n rec where
-    Leaf :: vec (key,value) -> GiSTr vec set key value 'Z rec
-    Node :: V.Vector (set, rec) -> GiSTr vec set key value ('S n) rec
+    Leaf :: !(vec (key,value)) -> GiSTr vec set key value 'Z rec
+    Node :: !(V.Vector (set, rec)) -> GiSTr vec set key value ('S n) rec
 
 instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value n rec) where
     rnf (Leaf v) = rnf v
