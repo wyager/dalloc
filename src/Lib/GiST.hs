@@ -1,6 +1,7 @@
 -- Attempting to reconcile depth-typed GiST with Schemes
 
 {-# LANGUAGE UndecidableInstances #-} -- Show constraints
+
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Lib.GiST (
@@ -30,6 +31,9 @@ import Control.Monad.Trans.Class (lift)
 import Control.DeepSeq (NFData, rnf)
 import GHC.Generics (Generic)
 
+import Data.Strict.Tuple (Pair((:!:)))
+import qualified Data.Strict.Tuple as T2
+
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
 data V2 x = V2 x x
@@ -53,13 +57,13 @@ instance FoldFixI (FoldWithoutKey vec set key) where
         Leaf vec -> Vec.foldr (\(_k,v) acc -> f v =<< acc) (return b0) vec -- 
         Node vec -> Foldable.foldrM go b0 vec
             where
-            go (_set,subtree) acc = rec f acc subtree
+            go (_set :!: subtree) acc = rec f acc subtree
     {-# INLINEABLE rfoldli'_ #-}
     rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc (_k,v) -> acc >>= flip f v) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
             where
-            go  acc (_set,subtree) = rec f acc subtree
+            go  acc (_set :!: subtree) = rec f acc subtree
 
 instance FoldFixI (FoldWithKey vec set) where
     {-# INLINEABLE rfoldri_ #-}
@@ -67,13 +71,13 @@ instance FoldFixI (FoldWithKey vec set) where
         Leaf vec -> Vec.foldr (\kv acc -> f kv =<< acc) (return b0) vec -- 
         Node vec -> Foldable.foldrM go b0 vec
             where
-            go (_set,subtree) acc = rec f acc subtree
+            go (_set :!: subtree) acc = rec f acc subtree
     {-# INLINEABLE rfoldli'_ #-}
     rfoldli'_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc kv -> acc >>= flip f kv) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
             where
-            go  acc (_set,subtree) = rec f acc subtree
+            go  acc (_set :!: subtree) = rec f acc subtree
 
 
 instance FoldFixI (FoldWithVec set) where
@@ -82,17 +86,23 @@ instance FoldFixI (FoldWithVec set) where
         Leaf vec -> f vec b0
         Node vec -> Foldable.foldrM go b0 vec
             where
-            go (_set,subtree) acc = rec f acc subtree
+            go (_set :!: subtree) acc = rec f acc subtree
     {-# INLINEABLE rfoldli'_ #-}
     rfoldli'_ rec = \f b0 (FoldWithVec g) -> case g of
         Leaf vec -> f b0 vec 
         Node vec -> Foldable.foldlM go b0 vec
             where
-            go  acc (_set,subtree) = rec f acc subtree
+            go  acc (_set :!: subtree) = rec f acc subtree
 
 data GiSTr vec set key value n rec where
     Leaf :: !(vec (key,value)) -> GiSTr vec set key value 'Z rec
-    Node :: !(V.Vector (set, rec)) -> GiSTr vec set key value ('S n) rec
+    Node :: !(V.Vector (Pair set rec)) -> GiSTr vec set key value ('S n) rec
+
+instance (NFData a, NFData b) => NFData (Pair a b) where
+    rnf (a :!: b) = rnf (a,b)
+instance Functor (Pair a) where 
+    fmap f (a :!: b) = (a :!: f b )
+
 
 instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value n rec) where
     rnf (Leaf v) = rnf v
@@ -121,7 +131,7 @@ class Ord (Penalty set) => Key key set | set -> key where
     overlaps :: set -> set -> Bool
     unions :: Foldable f => f set -> set
     penalty :: set -> set -> Penalty set
-    partitionSets :: Vector vec (set,val) => FillFactor -> vec (set,val) -> Int -> V2 (set,val) -> AFew (vec (set,val)) 
+    partitionSets :: Vector vec (Pair set val) => FillFactor -> vec (Pair set val) -> Int -> V2 (Pair set val) -> AFew (vec (Pair set val)) 
     -- NB: This can be as simple as "cons" if we don't care about e.g. keeping order among keys
     insertKey :: Vector vec (key,val) => proxy set -> FillFactor -> key -> val -> vec (key,val) -> AFew (vec (key,val)) 
 
@@ -148,7 +158,7 @@ search' embed predicate = go
             q <- read g
             case q of
                 Node vec -> do
-                    let f acc (subpred, subgist) = if overlaps predicate subpred 
+                    let f acc (subpred :!: subgist) = if overlaps predicate subpred 
                         then do
                             subacc <- go (GiSTn subgist)
                             return (acc <> subacc)
@@ -183,12 +193,14 @@ class BackingStore m r w vec set k v | m -> r w where
     leaveS :: forall h proxy . proxy m -> GiSTn r vec set k v h -> GiSTn w vec set k v h
 
 instance BackingStore Identity Identity Identity vec set k v where
+    {-# INLINE saveS #-}
     saveS = Identity . Identity
+    {-# INLINE saveZ #-}
     saveZ = Identity . Identity
+    {-# INLINE leaveS #-}
     leaveS _ = id
 
 
--- {-# SPECIALIZE insert' 
 {-# INLINABLE insert' #-}
 insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
        =>
@@ -196,52 +208,57 @@ insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v, Ba
        -> GiSTn r vec set k v h
        -> m (Either ((GiSTn w vec set k v h)) ((GiSTn w vec set k v ('S h))))
 insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
-            One (_set, gist) -> return $ Left gist
-            Two (aSet, GiSTn aGiSTn) (bSet, GiSTn bGiSTn) -> fmap (Right . GiSTn . FixN . ComposeI) $ saveS node 
+            One (_set :!: gist) -> return $ Left gist
+            Two (aSet  :!:  GiSTn aGiSTn) (bSet :!: GiSTn bGiSTn) -> fmap (Right . GiSTn . FixN . ComposeI) $ saveS node 
                 where
-                node =  Node $ V.fromList [(aSet, aGiSTn), (bSet, bGiSTn)]
+                node =  Node $ V.fromList [(aSet :!: aGiSTn), (bSet :!: bGiSTn)]
 
-{-# INLINABLE insertAndSplit #-}
+{-# INLINE insertAndSplit #-}
 insertAndSplit :: forall m r w vec set k v h
                . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
                => FillFactor
                -> k -> v
                ->          GiSTn r vec set k v h    
-               -> m (AFew (set, (GiSTn w vec set k v h))) -- That which has been saved
+               -> m (AFew (Pair set (GiSTn w vec set k v h))) -- That which has been saved
 insertAndSplit ff@FillFactor{..} key value = go 
     where
-    go :: forall h' . GiSTn r vec set k v h' -> m (AFew (set, GiSTn w vec set k v h'))
+    go :: forall h' . GiSTn r vec set k v h' -> m (AFew (Pair set (GiSTn w vec set k v h')))
     go !(GiSTn (FixZ (ComposeI (free))))  = do
         vec <- read @m @r free >>= \case Leaf vec -> return vec
         let newVecs :: AFew (vec (k, v))
             newVecs = insertKey (Proxy @set) ff key value vec  
             setOf = unions . map (exactly . fst) . Vec.toList 
             save = fmap (GiSTn . FixZ . ComposeI) . saveZ . Leaf
-        traverse (\entries -> (setOf entries :: set, ) <$> save entries) newVecs    
-    go !(GiSTn (FixN (ComposeI (free))))  = do
+        traverse (\entries -> ((setOf entries :: set)  :!:) <$> save entries) newVecs    
+    go !(GiSTn (FixN (ComposeI (free)))) = do
         node <- read @m @r free 
-        let vec = case node of Node v -> v
+        let vec = foo $ case node of Node v -> foo v 
         case chooseSubtree node (exactly key) of
             Nothing -> error "GiST node is empty, violating data structure invariants"
             Just (bestIx, best) -> do
                 inserted <- go (GiSTn best)
                 let reuse r = let (GiSTn w) = leaveS (Proxy @m) (GiSTn r) in w
+                let force v =  Vec.foldl' (\u (s :!: g) -> s `seq` g `seq` u) () v
                 case inserted of
-                    One (set, GiSTn gist) -> do
-                        let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set,gist))]
-                        -- let vec' = Vec.imap (\i old -> if i == bestIx then (set, gist) else fmap reuse old) vec
-                        let set' = unions $ map fst $ Vec.toList vec'
-                        -- let !_ = Vec.foldl' (flip seq) () vec'
+                    One (set  :!: GiSTn gist) -> do
+                        let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set :!: gist))]
+                        let set' = unions $ map T2.fst $ Vec.toList vec'
+                        let !() = force vec'
                         saved <- saveS (Node vec')
-                        return $ One (set', GiSTn $ FixN $ ComposeI saved)
-                    Two (setL, GiSTn l) (setR, GiSTn r) -> do
+                        return $ One (set' :!: (GiSTn $ FixN $ ComposeI saved))
+                    Two (setL :!: GiSTn l) (setR  :!:  GiSTn r) -> do
                         let untouched = fmap (fmap reuse) vec
                         let wrap vec' = do
+                                let !() = force vec'
                                 saved <- saveS (Node vec')
-                                return (unions (fmap fst vec'),GiSTn $ FixN $ ComposeI saved)
-                        case partitionSets ff untouched bestIx (V2 (setL, l) (setR, r)) of
+                                return (unions (fmap T2.fst vec') :!: (GiSTn $ FixN $ ComposeI saved))
+                        case partitionSets ff untouched bestIx (V2 (setL :!: l) (setR :!: r)) of
                             One v -> One <$> wrap v
                             Two v1 v2 -> Two <$> wrap v1 <*> wrap v2
+
+
+foo :: V.Vector (Pair a b) -> V.Vector (Pair a b)
+foo = id
 
 {-# INLINE chooseSubtree #-}
 chooseSubtree :: forall vec set k v h x . (IsGiST vec set k v)
@@ -251,7 +268,7 @@ chooseSubtree :: forall vec set k v h x . (IsGiST vec set k v)
 chooseSubtree (Node vec) predicate = ignored . getMin <$> bestSubtree
     where
     bestSubtree = Vec.ifoldl' (\best i next -> best <> f i next) Nothing vec
-    f ix (subpred, subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
+    f ix (subpred  :!:  subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
 
 
 data Ignoring a o = Ignoring {ignored :: a, unignored :: o}
@@ -366,7 +383,7 @@ empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 {-# SPECIALIZE insert :: FillFactor -> Int -> Int -> GiST Identity VU.Vector (Within Int) Int Int -> Identity (GiST Identity VU.Vector (Within Int) Int Int) #-}
 {-# INLINABLE insert #-}
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
-insert ff k v (GiST g) = either GiST GiST <$> (insert' ff k v g)
+insert ff k v (GiST !g) = either GiST GiST <$> (insert' ff k v g)
 
 
 

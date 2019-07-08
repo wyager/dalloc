@@ -6,7 +6,7 @@ import qualified Lib.GiST as G
 import           Data.Time.Clock (getCurrentTime)
 
 main = do
-    let b = Ex.bigSet (G.FillFactor 4 8) 200000 
+    let b = Ex.bigSet (G.FillFactor 16 32) 200000 
     print =<< getCurrentTime
     putStrLn "Forcing"
 

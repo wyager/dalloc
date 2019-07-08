@@ -89,6 +89,7 @@ library:
   - exceptions
   - random
   - cryptonite
+  - strict
   ghc-options:
   - -O2
   - -Wall

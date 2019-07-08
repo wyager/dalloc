@@ -7,7 +7,6 @@ import qualified Data.Vector.Generic as VG
 import           Data.Functor.Identity (Identity, runIdentity)
 import qualified Streaming.Prelude as SP
 -- import           Data.Foldable (foldl')
-import qualified Control.DeepSeq as DS
 
 
 e :: VU.Unbox v => G.GiST Identity Vector (G.Within Int) Int v
@@ -24,11 +23,10 @@ s2 :: SP.Stream (SP.Of (Int,Char)) Identity ()
 s2 = G.transformed $ G.search (VU.foldM_ (\() (k,v) -> G.Transforming $ SP.yield (k,v)) ()) (G.Within 6 20) f
 
 bigSet :: G.FillFactor -> Int -> G.GiST Identity Vector (G.Within Int) Int Int
-bigSet ff n = go 0 (0 :: Int) e
+bigSet ff n = go 0 e
     where
-    go !i !fc !g | i == n = g
-                 | fc == 50000 = go i 0 (DS.force g)
-                 | otherwise = go (i+1) (fc+1) $ runIdentity $ G.insert ff i i g
+    go !i !g | i == n = g
+             | otherwise = go (i+1) $ runIdentity $ G.insert ff i i g
 
 force :: G.GiST Identity Vector (G.Within Int) Int Int -> Int
 force g = runIdentity $ G.foldli' id (\a (k,v) -> a + k + v) 0 g
