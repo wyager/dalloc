@@ -5,7 +5,7 @@
 
 module Lib.GiST (
     GiST, Within(..), FillFactor(..), Transforming(..),
-    IsGiST, R,
+    IsGiST, R, BackingStore, read, exactly,
     empty, insert, search,
     foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv'
 ) where
@@ -14,7 +14,7 @@ import Prelude hiding (read, foldr)
 import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', imap, length, splitAt, span, singleton, tail, fromList) 
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', length, splitAt, span, singleton, tail, fromList, (//)) 
 import qualified Data.Vector.Generic as Vec (foldr, foldl', empty) 
 import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
@@ -228,8 +228,10 @@ insertAndSplit ff@FillFactor{..} key value = go
                 let reuse r = let (GiSTn w) = leaveS (Proxy @m) (GiSTn r) in w
                 case inserted of
                     One (set, GiSTn gist) -> do
-                        let vec' = Vec.imap (\i old -> if i == bestIx then (set, gist) else fmap reuse old) vec
+                        let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set,gist))]
+                        -- let vec' = Vec.imap (\i old -> if i == bestIx then (set, gist) else fmap reuse old) vec
                         let set' = unions $ map fst $ Vec.toList vec'
+                        -- let !_ = Vec.foldl' (flip seq) () vec'
                         saved <- saveS (Node vec')
                         return $ One (set', GiSTn $ FixN $ ComposeI saved)
                     Two (setL, GiSTn l) (setR, GiSTn r) -> do
@@ -257,7 +259,7 @@ instance Eq o => Eq (Ignoring a o) where x == y = unignored x == unignored y
 instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (unignored y)
 
 
-data Within a = Within {withinLo :: a, withinHi :: a} | Empty 
+data Within a = Within {withinLo :: !a, withinHi :: !a} | Empty 
     deriving (Eq, Ord, Show, Generic)
     deriving anyclass NFData
 
@@ -302,7 +304,7 @@ instance (Ord a, Num a) => Key a (Within a) where
 
 
 data GiST f vec set key value where
-    GiST :: GiSTn f vec set key value height -> GiST f vec set key value
+    GiST :: !(GiSTn f vec set key value height) -> GiST f vec set key value
 
 instance (NFData (vec (key,value)), NFData set, forall a . NFData a => NFData (f a)) => NFData (GiST f vec set key value) where
     rnf (GiST g) = rnf g
