@@ -8,7 +8,8 @@ module Lib.GiST (
     GiST, Within(..), FillFactor(..), Transforming(..),
     IsGiST, R, BackingStore, read, exactly,
     empty, insert, search,
-    foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv'
+    foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv',
+    mergeOn
 ) where
 
 import Prelude hiding (read, foldr)
@@ -16,7 +17,8 @@ import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
 import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', length, splitAt, span, singleton, tail, fromList, (//)) 
-import qualified Data.Vector.Generic as Vec (foldr, foldl', empty) 
+import qualified Data.Vector.Generic as Vec 
+import qualified Data.Vector.Generic.Mutable as VecM
 import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
 import Data.Proxy (Proxy(Proxy))
@@ -318,6 +320,27 @@ instance (Ord a, Num a) => Key a (Within a) where
             else let (lo,hi) = Vec.splitAt (Vec.length new `div` 2) new in Two lo hi
             
 
+-- Merge two already sorted vectors
+mergeOn :: (Ord b, Vector v a) => (a -> b) -> v a -> v a -> v a
+mergeOn f a_ b_ = Vec.create $ do
+    let la = Vec.length a_
+    let lb = Vec.length b_
+    let lv = la + lb
+    a <- Vec.unsafeThaw a_
+    b <- Vec.unsafeThaw b_
+    v <- VecM.new lv
+    let go ia ib
+            | ia == la && ib == lb = return ()
+            | ib == lb = VecM.unsafeCopy (VecM.slice (ia + ib) (lv - (ia + ib)) v) (VecM.slice ia (la - ia) a)
+            | ia == la = VecM.unsafeCopy (VecM.slice (ia + ib) (lv - (ia + ib)) v) (VecM.slice ib (lb - ib) b)
+            | otherwise = do
+                av <- VecM.unsafeRead a ia
+                bv <- VecM.unsafeRead b ib
+                if f av < f bv
+                    then VecM.unsafeWrite v (ia + ib) av >> go (ia+1) ib
+                    else VecM.unsafeWrite v (ia + ib) bv >> go ia (ib+1)
+    go 0 0
+    return v
 
 
 data GiST f vec set key value where
@@ -380,7 +403,6 @@ foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
 empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec set k v, Functor m) => m (GiST w vec set k v)
 empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 
-{-# SPECIALIZE insert :: FillFactor -> Int -> Int -> GiST Identity VU.Vector (Within Int) Int Int -> Identity (GiST Identity VU.Vector (Within Int) Int Int) #-}
 {-# INLINABLE insert #-}
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v (GiST !g) = either GiST GiST <$> (insert' ff k v g)
