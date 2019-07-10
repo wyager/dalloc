@@ -13,8 +13,10 @@ main =
         ]
     where
     ff min max = CM.bgroup (show (min,max)) (withFF (G.FillFactor min max))
-    withFF ff =
-       [CM.bench "insert 100 elements into GiST" $ CM.nf (Gex.bigSet ff)  100
+    withFF ff@(G.FillFactor _min max_) =
+        [ CM.bench "insert max elements into GiST" $ CM.nf (Gex.bigSet ff) max_
+        , CM.bench "insert (max+1) elements into GiST" $ CM.nf (Gex.bigSet ff) (max_+1)
+        , CM.bench "insert 100 elements into GiST" $ CM.nf (Gex.bigSet ff)  100
         , CM.bench "insert 1,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 1000
         , CM.bench "insert 10,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 10000
         , CM.bench "insert 100,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 100000
