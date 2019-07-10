@@ -17,6 +17,8 @@ main =
        [CM.bench "insert 100 elements into GiST" $ CM.nf (Gex.bigSet ff)  100
         , CM.bench "insert 1,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 1000
         , CM.bench "insert 10,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 10000
+        , CM.bench "insert 100,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 100000
+        , CM.bench "insert 1,000,000 elements into GiST" $ CM.nf (Gex.bigSet ff) 1000000
         , CM.env (return (Gex.bigSet ff 1000000)) (\set -> CM.bgroup "add up 1,000,000 values in a GiST"
             [ CM.bench "plain foldl'"  $ CM.whnf Gex.speedFold  set
             , CM.bench "vec foldl'"    $ CM.whnf Gex.speedFoldV set

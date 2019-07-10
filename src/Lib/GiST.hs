@@ -304,13 +304,13 @@ instance (Ord a, Num a) => Key a (Within a) where
     overlaps _ Empty = False
     unions = fold
     penalty old new = size (old <> new) - size old
+    {-# INLINE insertKey #-}
     insertKey _ ff k v vec = 
         if Vec.length new <= maxFill ff
             then One new
             else let (l,r) = Vec.splitAt (Vec.length new `div` 2) new in Two l r
         where
-        (before,after) = Vec.span ((<= k) . fst) vec
-        new = Vec.concat [before, Vec.singleton (k,v), after]
+        new = mergeOn fst vec (Vec.singleton (k,v))
     partitionSets ff vec i (V2 l r) =
         let (before, after') = Vec.splitAt i vec in
         let after = Vec.tail after' in
@@ -321,24 +321,27 @@ instance (Ord a, Num a) => Key a (Within a) where
             
 
 -- Merge two already sorted vectors
+{-# INLINE mergeOn #-}
 mergeOn :: (Ord b, Vector v a) => (a -> b) -> v a -> v a -> v a
-mergeOn f a_ b_ = Vec.create $ do
-    let la = Vec.length a_
-    let lb = Vec.length b_
+mergeOn f a b = Vec.create $ do
+    let la = Vec.length a
+    let lb = Vec.length b
     let lv = la + lb
-    a <- Vec.unsafeThaw a_
-    b <- Vec.unsafeThaw b_
     v <- VecM.new lv
-    let go ia ib
+    let go !ia !ib
             | ia == la && ib == lb = return ()
-            | ib == lb = VecM.unsafeCopy (VecM.slice (ia + ib) (lv - (ia + ib)) v) (VecM.slice ia (la - ia) a)
-            | ia == la = VecM.unsafeCopy (VecM.slice (ia + ib) (lv - (ia + ib)) v) (VecM.slice ib (lb - ib) b)
+            | ib == lb = do
+                let av =  a Vec.! ia
+                VecM.write v (ia + ib) av >> go (ia+1) ib
+            | ia == la = do
+                let bv =  b Vec.! ib
+                VecM.write v (ia + ib) bv >> go ia (ib+1)
             | otherwise = do
-                av <- VecM.unsafeRead a ia
-                bv <- VecM.unsafeRead b ib
+                let av =  a Vec.! ia
+                let bv =  b Vec.! ib
                 if f av < f bv
-                    then VecM.unsafeWrite v (ia + ib) av >> go (ia+1) ib
-                    else VecM.unsafeWrite v (ia + ib) bv >> go ia (ib+1)
+                    then VecM.write v (ia + ib) av >> go (ia+1) ib
+                    else VecM.write v (ia + ib) bv >> go ia (ib+1)
     go 0 0
     return v
 
