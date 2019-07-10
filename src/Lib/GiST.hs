@@ -16,7 +16,7 @@ import Prelude hiding (read, foldr)
 import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector.Storable as VS
-import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', length, splitAt, span, singleton, tail, fromList, (//)) 
+import Data.Vector.Generic as Vec (Vector, toList, filter, foldM, concat, ifoldl', length, splitAt, singleton, tail, fromList, (//)) 
 import qualified Data.Vector.Generic as Vec 
 import qualified Data.Vector.Generic.Mutable as VecM
 import Data.Semigroup (Min(Min,getMin))
@@ -240,7 +240,7 @@ insertAndSplit ff@FillFactor{..} key value = go
             Just (bestIx, best) -> do
                 inserted <- go (GiSTn best)
                 let reuse r = let (GiSTn w) = leaveS (Proxy @m) (GiSTn r) in w
-                let force v =  Vec.foldl' (\u (s :!: g) -> s `seq` g `seq` u) () v
+                    force v =  Vec.foldl' (\u p -> p `seq` u) () v
                 case inserted of
                     One (set  :!: GiSTn gist) -> do
                         let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set :!: gist))]
@@ -283,6 +283,7 @@ data Within a = Within {withinLo :: !a, withinHi :: !a} | Empty
     deriving anyclass NFData
 
 instance Ord a => Semigroup (Within a) where
+    {-# INLINE (<>) #-}
     (Within l1 h1) <> (Within l2 h2) = Within (min l1 l2) (max h1 h2)
     Empty <> a = a
     a <> Empty = a
@@ -293,16 +294,21 @@ class Sized f where
     size :: Num a => f a -> a
 
 instance Sized Within where
+    {-# INLINE size #-}
     size (Within l h) = h - l
     size Empty = 0
 
 instance (Ord a, Num a) => Key a (Within a) where
     type Penalty (Within a) = a
+    {-# INLINE exactly #-}
     exactly a = Within a a
+    {-# INLINE overlaps #-}
     overlaps (Within l1 h1) (Within l2 h2) = l1 <= h2 && l2 <= h1
     overlaps Empty _ = False
     overlaps _ Empty = False
+    {-# INLINE unions #-}
     unions = fold
+    {-# INLINE penalty #-}
     penalty old new = size (old <> new) - size old
     {-# INLINE insertKey #-}
     insertKey _ ff k v vec = 
@@ -311,6 +317,7 @@ instance (Ord a, Num a) => Key a (Within a) where
             else let (l,r) = Vec.splitAt (Vec.length new `div` 2) new in Two l r
         where
         new = mergeOn fst vec (Vec.singleton (k,v))
+    {-# INLINE partitionSets #-}
     partitionSets ff vec i (V2 l r) =
         let (before, after') = Vec.splitAt i vec in
         let after = Vec.tail after' in
