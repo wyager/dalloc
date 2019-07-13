@@ -1,10 +1,8 @@
--- Attempting to reconcile depth-typed GiST with Schemes
-
 {-# LANGUAGE UndecidableInstances #-} -- Show constraints
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Lib.GiST (
+module Lib.Structures.GiST (
     GiST, Within(..), FillFactor(..), Transforming(..),
     IsGiST, R, BackingStore, read, exactly,
     empty, insert, search,
@@ -23,7 +21,7 @@ import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
-import Lib.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri)
+import Lib.Structures.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
@@ -142,6 +140,7 @@ instance (VU.Unbox key, VU.Unbox value, Key key set) => IsGiST VU.Vector set key
 instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key value
 instance Key key set => IsGiST V.Vector set key value
 
+{-# INLINE search' #-}
 search' :: forall vec height m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
@@ -167,6 +166,7 @@ search' embed predicate = go
                         else return acc
                     Vec.foldM f mempty (vec)
 
+{-# INLINABLE search #-}
 search :: forall vec m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
@@ -362,50 +362,59 @@ instance (NFData (vec (key,value)), NFData set, forall a . NFData a => NFData (f
 instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
     show (GiST g) = show g
 
+{-# INLINE cronk #-}
+cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
+cronk f a b = return (f a b)
 
+
+{-# INLINE foldrM #-}
 foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
 foldrM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
 
 
+{-# INLINE foldriM #-}
 foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> ((k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
 foldriM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithKey f b g
 
 
+{-# INLINE foldrvM #-}
 foldrvM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (vec (k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
 foldrvM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithVec f b g
 
-
-
+{-# INLINE foldlM' #-}
 foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> v -> t m b) -> b -> GiST r vec set key v -> t m b
 foldlM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithoutKey f b g
 
+{-# INLINE foldliM' #-}
 foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
 foldliM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithKey f b g
 
+{-# INLINE foldlvM' #-}
 foldlvM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> vec (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
 foldlvM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithVec f b g
 
 
-
-cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
-cronk f a b = return (f a b)
-
+{-# INLINE foldr #-}
 foldr :: (Monad m, Vector vec (key,v)) => (forall x . r x -> m x) -> (v -> b -> b) -> b -> GiST r vec set key v -> m b
 foldr r2m f b = runIdentityT . foldrM r2m (cronk f) b 
 
+{-# INLINE foldri #-}
 foldri :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> ((k,v) -> b -> b) -> b -> GiST r vec set k v -> m b
 foldri r2m f b = runIdentityT . foldriM r2m (cronk f) b 
 
+{-# INLINE foldrv #-}
 foldrv :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (vec (k,v) -> b -> b) -> b -> GiST r vec set k v -> m b
 foldrv r2m f b = runIdentityT . foldrvM r2m (cronk f) b 
 
-
+{-# INLINE foldl' #-}
 foldl' :: (Monad m, Vector vec (key,v)) => (forall x . r x -> m x) -> (b -> v -> b) -> b -> GiST r vec set key v -> m b
 foldl' r2m f b = runIdentityT . foldlM' r2m (cronk f) b 
 
+{-# INLINE foldli' #-}
 foldli' :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (b -> (k,v) -> b) -> b -> GiST r vec set k v -> m b
 foldli' r2m f b = runIdentityT . foldliM' r2m (cronk f) b
 
+{-# INLINE foldlv' #-}
 foldlv' :: (Monad m, Vector vec (k,v)) => (forall x . r x -> m x) -> (b -> vec (k,v) -> b) -> b -> GiST r vec set k v -> m b
 foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
 
@@ -413,7 +422,7 @@ foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
 empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec set k v, Functor m) => m (GiST w vec set k v)
 empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 
-{-# INLINABLE insert #-}
+{-# INLINE insert #-}
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v (GiST !g) = either GiST GiST <$> (insert' ff k v g)
 

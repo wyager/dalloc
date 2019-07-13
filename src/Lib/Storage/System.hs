@@ -1,5 +1,5 @@
 {-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
-module Lib.System  where
+module Lib.Storage.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
@@ -1172,9 +1172,6 @@ demoIO = do
     (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
     print (length refs)
 
-
--- NB: The MonadIO instance serves only to construct a function `:: forall a . X -> m a` where `m` has a `MonadConc` instance.
--- If I can do that without MonadIO, I can get rid of it.
 test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n NoGC -> n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS

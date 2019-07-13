@@ -145,6 +145,7 @@ tests:
     - dejafu
     - vector
     - criterion
+    - exceptions
 
 benchmarks:
   dalloc-bench:

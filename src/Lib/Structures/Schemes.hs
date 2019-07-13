@@ -1,5 +1,5 @@
 {-# LANGUAGE UndecidableInstances #-} -- for NFData FixN
-module Lib.Schemes where
+module Lib.Structures.Schemes where
 
 import Control.Monad.Trans.Class (MonadTrans, lift)
 import Data.Fix (Fix(..))
