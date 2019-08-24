@@ -97,7 +97,7 @@ library:
   # - -Werror
 
 executables:
-  dalloc-exe:
+  dalloc:
     main:                Main.hs
     source-dirs:         app
     ghc-options:
@@ -146,6 +146,7 @@ tests:
     - vector
     - criterion
     - exceptions
+    - mtl
 
 benchmarks:
   dalloc-bench:

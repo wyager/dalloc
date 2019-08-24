@@ -3,13 +3,14 @@
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
 module Lib.Structures.GiST (
-    GiST, Within(..), FillFactor(..), Transforming(..),
+    GiST, saveS, saveZ, leaveS, Within(..), FillFactor(..), Transforming(..),
     IsGiST, R, BackingStore, read, exactly,
     empty, insert, search,
     foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv',
     mergeOn
 ) where
 
+import qualified Data.Store as S
 import Prelude hiding (read, foldr)
 import qualified Data.Vector as V (Vector, fromList)
 import qualified Data.Vector.Unboxed as VU
@@ -33,6 +34,9 @@ import GHC.Generics (Generic)
 
 import Data.Strict.Tuple (Pair((:!:)))
 import qualified Data.Strict.Tuple as T2
+import Data.Functor.Contravariant (contramap)
+
+import Data.Word (Word8)
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -98,6 +102,23 @@ data GiSTr vec set key value n rec where
     Leaf :: !(vec (key,value)) -> GiSTr vec set key value 'Z rec
     Node :: !(V.Vector (Pair set rec)) -> GiSTr vec set key value ('S n) rec
 
+instance (S.Store a, S.Store b) => S.Store (Pair a b) where
+    size = contramap (\(a :!: b) -> (a,b)) S.size
+    peek = fmap (\(a,b) -> (a :!: b)) S.peek
+    poke = S.poke . (\(a :!: b) -> (a,b))
+
+instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value 'Z rec) where
+    size = contramap (\(Leaf v) -> v) S.size
+    poke = S.poke . (\(Leaf v) -> v)
+    peek = fmap Leaf S.peek
+
+
+instance (S.Store set, S.Store rec) => S.Store (GiSTr vec set key value ('S n) rec) where
+    size = contramap (\(Node v) -> v) S.size
+    poke = S.poke . (\(Node v) -> v)
+    peek = fmap Node S.peek
+
+
 instance (NFData a, NFData b) => NFData (Pair a b) where
     rnf (a :!: b) = rnf (a,b)
 instance Functor (Pair a) where 
@@ -109,6 +130,11 @@ instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec
     rnf (Node v) = rnf v
 
 data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
+
+-- instance ((forall r . S.Store r => S.Store (f r)), S.Store (vec (key,value)), S.Store set) => S.Store (GiSTn f vec set key value n) where
+--     size = contramap (\(GiSTn v) -> v) S.size
+--     poke = S.poke . (\(GiSTn v) -> v)
+--     peek = fmap GiSTn S.peek
 
 instance (forall a . NFData a => NFData (f a), NFData (vec (key,value)), NFData set) => NFData (GiSTn f vec set key value n) where
     rnf (GiSTn g) = rnf g
@@ -280,7 +306,8 @@ instance Ord o => Ord (Ignoring a o) where compare x y = compare (unignored x) (
 
 data Within a = Within {withinLo :: !a, withinHi :: !a} | Empty 
     deriving (Eq, Ord, Show, Generic)
-    deriving anyclass NFData
+    deriving anyclass (NFData, S.Store)
+
 
 instance Ord a => Semigroup (Within a) where
     {-# INLINE (<>) #-}
@@ -355,6 +382,31 @@ mergeOn f a b = Vec.create $ do
 
 data GiST f vec set key value where
     GiST :: !(GiSTn f vec set key value height) -> GiST f vec set key value
+
+-- instance (S.Store set, S.Store (vec (key,value)), (forall r . S.Store r => S.Store (f r))) => S.Store (GiST f vec set key value) where
+--     size = S.VarSize $ \case
+--         (GiST (GiSTn (FixZ fg))) -> case S.size of
+--             S.VarSize f -> 1 + f fg
+--             S.ConstSize c -> 1 + c
+--         (GiST (GiSTn (FixN fg))) -> case contramap (GiST . GiSTn) S.size of
+--             S.VarSize f -> 1 + f fg
+--             S.ConstSize c -> 1 + c
+--     poke = undefined 
+--         -- \case
+--         -- (GiST (GiSTn (FixZ fg))) -> S.poke (0 :: Word8) >> S.poke fg
+--         -- (GiST (GiSTn (FixN fg))) -> S.poke (1 :: Word8) >> S.poke fg
+--     peek = undefined
+
+-- instance (S.Store set, S.Store rec) => S.Store (GiSTr vec set key value ('S n) rec) where
+--     size = contramap (\(Node v) -> v) S.size
+--     poke = S.poke . (\(Node v) -> v)
+--     peek = fmap Node S.peek
+
+-- instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value 'Z rec) where
+
+-- data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
+
+
 
 instance (NFData (vec (key,value)), NFData set, forall a . NFData a => NFData (f a)) => NFData (GiST f vec set key value) where
     rnf (GiST g) = rnf g

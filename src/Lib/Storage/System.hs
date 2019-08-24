@@ -1,4 +1,5 @@
 {-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
+{-# LANGUAGE RoleAnnotations #-}  
 module Lib.Storage.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
@@ -21,6 +22,7 @@ import           System.IO.MMap (mmapFileByteString)
 import           System.Directory (doesFileExist, renameFile, removeFile)
 import           Data.Word (Word64)
 import qualified Data.Vector.Storable as VS
+import qualified Data.Vector.Unboxed as VU
 import qualified Data.Vector as V
 import           Data.LruCache as Lru (LruCache, empty, lookup, insertView)
 import           Data.Hashable (Hashable, hash)
@@ -37,7 +39,7 @@ import           Control.Monad.IO.Class (MonadIO, liftIO)
 import           GHC.Exts (Constraint)
 import           Type.Reflection (Typeable)
 import           Data.Void (Void, absurd)
-import           Control.Monad.Reader (ReaderT(..), ask)
+import           Control.Monad.Reader (ReaderT(..), ask, MonadReader)
 import           Control.Monad.State.Strict (StateT(..), modify, get, put, evalStateT)
 import           Control.Monad (replicateM, forever)
 import           Data.Bits ((.&.), shiftL)
@@ -47,6 +49,7 @@ import           Numeric.Search.Range (searchFromTo)
 import           System.Random (RandomGen, randomR)
 import           Data.Tuple (swap)
 import           Data.Proxy (Proxy(Proxy))
+import qualified Lib.Structures.GiST as G
 -- import           Data.Coerce (coerce)
 
 newtype Segment = Segment Word64
@@ -59,6 +62,7 @@ newtype Offset = Offset Word64
     deriving newtype (Eq, Ord, Store, Storable, Num, Show)
 
 data Assoc = Assoc !Ix !Offset
+
 
 assocPtrs :: Ptr Assoc -> (Ptr Ix, Ptr Offset)
 assocPtrs ptr = (castPtr ptr, castPtr ptr `plusPtr` 8)
@@ -1172,13 +1176,31 @@ demoIO = do
     (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
     print (length refs)
 
-test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBState n NoGC -> n a) -> m (Map FilePath Builder, a)
+
+newtype DBT gc m a = DBT {runDBT :: DBState m gc -> m a}
+    deriving (Functor, Applicative, Monad, MonadReader (DBState m gc)) via (ReaderT (DBState m gc) m)
+instance MonadTrans (DBT gc) where lift = DBT . const
+
+type role Reft representational
+newtype Reft a = Reft {reft :: Ref}
+    deriving newtype Store
+
+-- NB: This does not deal with transactions or flushing
+-- instance (MonadConc m, MonadEvaluate m)=> G.BackingStore (DBT NoGC m) Reft Reft VU.Vector (G.Within Int) Int Int where
+--     saveS vector = do
+--         wq <- dbWriter <$> ask
+--         lift $ do
+--             pending <- storeToQueue wq (encode vector) ()
+--             (ref, _flushed) <- wait pending
+--             return (Reft ref)
+
+test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBT NoGC n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
     let fs = FakeFilesystem $ \f -> modifyMVar fsState (return . f)
     result <- runMockDBMT throwM fs $ do
         state <- setupMock @NoGC cfg 
-        theTest state
+        runDBT theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)
 

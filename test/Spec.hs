@@ -1,5 +1,6 @@
 import Lib.Storage.System
   ( test
+  , DBT(..)
   , NoGC
   , MonadEvaluate
   , DBState
@@ -24,6 +25,8 @@ import Data.Void (Void, absurd)
 import Data.Proxy (Proxy(..))
 import Data.Functor.Identity (Identity, runIdentity)
 import Control.Monad (foldM)
+import Control.Monad.Reader (ask)
+import Control.Monad.Trans (lift)
 import Control.Concurrent.Classy.MVar
   (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 
@@ -87,7 +90,7 @@ main =
 -- Can be used in IO (for unit test) or with Dejafu (deadlock-free verification)
 demoMock :: MonadConc m => m (Map FilePath ByteString)
 demoMock =
-  fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ \state -> do
+  fmap (fmap (toStrict . toLazyByteString) . fst) $ test Map.empty mockDBConfig $ DBT $ \state -> do
     let wq = dbWriter state
     let rc = dbReaders state
     writes <- mapM (\c -> storeToQueue wq (ByteString.replicate (20) c) ()) $ take 2 [0x44 ..]
@@ -133,7 +136,7 @@ genRandomFilesystem
   => DBConfig (MockDBMT m) FakeHandle
   -> g
   -> m (Map FilePath Builder)
-genRandomFilesystem = \cfg g -> fmap fst $ test Map.empty cfg $ \state -> do
+genRandomFilesystem = \cfg g -> fmap fst $ test Map.empty cfg $ ask >>= \state -> lift $ do
   let wq = dbWriter state
   writes           <- mapM (\bs -> storeToQueue wq bs ()) $ randomBSs g
   (_refs, flushes) <- unzip <$> mapM wait writes
@@ -151,8 +154,8 @@ randomBSs g = fst $ Random.withDRG chacha $ mapM Random.getRandomBytes lens
 
 
 readEqualsWrite
-  :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBState m NoGC -> m Bool
-readEqualsWrite g state = do
+  :: forall m g . (MonadConc m, MonadEvaluate m, RandomGen g) => g -> DBT NoGC m Bool
+readEqualsWrite g = ask >>= \state -> lift $ do
   let wq          = dbWriter state
   let rc          = dbReaders state
   let byteStrings = randomBSs g

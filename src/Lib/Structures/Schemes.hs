@@ -9,6 +9,10 @@ import Control.Monad.Trans.Reader (ReaderT(..))
 import Data.Void (Void, absurd, vacuous)
 import GHC.Exts (Constraint)
 import Control.DeepSeq (NFData, rnf)
+import qualified Data.Store as S
+import Data.Functor.Contravariant (contramap)
+import Data.Proxy (Proxy(..))
+
 
 newtype MFoldR a b t (m :: * -> *) r = MFoldR {runMFoldR :: (a -> b -> t m b) -> b -> t m r }
     deriving (Functor, Applicative, Monad) via ReaderT (a -> b -> t m b) (ReaderT b (t m)) 
@@ -82,9 +86,60 @@ class FoldFixI (g :: * -> Nat -> * -> *) where
 
 
 data Nat = Z | S Nat
-data FixN n f where
+data FixN (n :: Nat) f where
     FixZ :: !(f  'Z     Void)      -> FixN  'Z    f
     FixN :: !(f ('S n) (FixN n f)) -> FixN ('S n) f
+
+
+class StoreN n a where
+  sizeN :: proxy n -> S.Size a
+  peekN :: proxy n -> S.Peek a
+  pokeN :: proxy n -> a -> S.Poke ()
+
+
+-- type family FixNIx a :: Nat where
+--   FixNIx (FixN n _) = n
+  -- FixNIx (FixN ('S n) _) = 'S n
+
+
+instance (S.Store (f 'Z Void)) => StoreN 'Z (FixN 'Z f) where
+  sizeN _ = contramap (\(FixZ f) -> f) S.size
+  peekN _ = FixZ <$> S.peek
+  pokeN _ = S.poke . (\(FixZ f) -> f)
+
+
+instance (forall m r . S.Store r => S.Store (f m r), StoreN n (FixN n f)) => StoreN ('S n) (FixN ('S n) f) where
+  sizeN _ = contramap (\(FixN f) -> f) S.size
+  peekN _ = FixN <$> S.peek
+  pokeN _ = S.poke . (\(FixN f) -> f)
+
+instance (StoreN n (FixN n f), forall r n . S.Store r => S.Store (f n r)) => S.Store (FixN n f) where
+  size = sizeN (Proxy @n) 
+  peek = peekN (Proxy @n) 
+  poke = pokeN (Proxy @n) 
+
+
+newtype Const f (n :: Nat) a = Const (f a)
+  deriving newtype S.Store
+
+newtype Test = Test (FixN ('S 'Z) (Const [])) 
+  deriving newtype S.Store
+
+
+-- instance (forall m r . S.Store r => S.Store (f m r)) => S.Store (FixN n f) where
+--   size = S.VarSize $ \case
+--           FixZ f -> case S.size @(f 'Z Void) of
+--             S.ConstSize x -> x
+-- instance (forall m r . S.Store r => S.Store (f m r))  => S.Store (FixN 'Z f) where
+--   size = contramap (\(FixZ f) -> f) S.size
+--   peek = FixZ <$> S.peek
+--   poke = S.poke . (\(FixZ f) -> f)
+
+-- instance (forall m r . S.Store r => S.Store (f m r), S.Store (FixN n f)) => S.Store (FixN ('S n) f) where
+--   size = contramap (\(FixN f) -> f) S.size
+--   peek = FixN <$> S.peek
+--   poke = S.poke . (\(FixN f) -> f)
+
 
 instance (forall j a . NFData a => NFData (f j a)) => NFData (FixN i f) where 
   rnf (FixZ f) = rnf f
@@ -92,9 +147,11 @@ instance (forall j a . NFData a => NFData (f j a)) => NFData (FixN i f) where
 
 newtype ComposeI (f :: * -> *) (g :: Nat -> * -> *) (n :: Nat) (a :: *)  = ComposeI {getComposeI :: f (g n a)}
   deriving newtype NFData
+  deriving S.Store via (f (g n a))
 
 instance (Functor f, Functor (g n)) => Functor (ComposeI f g n) where
   fmap q (ComposeI f) = ComposeI $ fmap (fmap q) f
+
 
 
 type Lift c f = (forall s . c s => c (f s) :: Constraint)

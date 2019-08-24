@@ -8,7 +8,7 @@ import Data.Time.Clock (getCurrentTime)
 main = do
   print =<< getCurrentTime
   putStrLn "Creating"
-  let !b = Ex.bigSet (G.FillFactor 16 32) 200000
+  let !b = Ex.bigSet (G.FillFactor 16 32) 1000000
   print =<< getCurrentTime
   putStrLn "Forcing"
 
