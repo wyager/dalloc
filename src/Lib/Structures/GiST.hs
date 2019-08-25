@@ -107,6 +107,9 @@ data GiSTr vec set key value rec
 -- deriving anyclass instance Lift NFData f => NFData (Fix f)
 
 newtype GiST f vec set key value = GiST (Fix (Compose f (GiSTr vec set key value)))
+
+instance NFData (GiST f vec set key value) where
+    rnf (GiST (Fix (Compose f))) = f `seq` ()
 --     deriving Generic
 
 -- instance (NFData (vec (key,value)), NFData set, Lift NFData f) => NFData (GiST f vec set key value)

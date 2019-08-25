@@ -1,7 +1,7 @@
 import qualified Criterion.Main as CM
 import qualified Criterion.Main.Options as CMO
-import qualified Lib.Structures.GiST as G
-import qualified Lib.Structures.GiST.Example as Gex
+import qualified Lib.Structures.GiSTn as G
+import qualified Lib.Structures.GiSTn.Example as Gex
 
 
 
