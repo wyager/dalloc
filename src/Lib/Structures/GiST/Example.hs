@@ -63,6 +63,6 @@ speedSearchS big = SP.fst' $ runIdentity $ SP.sum stream
     (G.Within 0 maxBound)
     big
 
-toList :: (G.IsGiST vec set k v, Monad m, G.R m r) => set -> G.GiST r vec set k v -> m [(k, v)]
+toList :: (G.IsGiST vec set k v, Monad m, G.Reads m r vec set k v) => set -> G.GiST r vec set k v -> m [(k, v)]
 toList = G.search (return . VG.toList)
 

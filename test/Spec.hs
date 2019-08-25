@@ -99,7 +99,7 @@ demoMock =
       [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
     flushWriteQueue wq
     mapM_ takeMVar flushes
-    readAll <- mapM (`readViaReadCache` rc) refs
+    readAll <- mapM (readViaReadCache rc) refs
     _       <- waitAny readAll
     return ()
 
@@ -163,11 +163,11 @@ readEqualsWrite g = ask >>= \state -> lift $ do
   refsAsyncs           <- async $ unzip <$> mapM wait writes
   (_, (refs, flushes)) <- waitAny
     [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refsAsyncs]
-  readAll1         <- mapM (`readViaReadCache` rc) refs
+  readAll1         <- mapM (readViaReadCache rc) refs
   readByteStrings1 <- mapM wait readAll1
   flushWriteQueue wq
   mapM_ takeMVar flushes
-  readAll2         <- mapM (`readViaReadCache` rc) refs
+  readAll2         <- mapM (readViaReadCache rc) refs
   readByteStrings2 <- mapM wait readAll2
   return (byteStrings == readByteStrings1 && readByteStrings1 == readByteStrings2)
 

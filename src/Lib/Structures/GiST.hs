@@ -4,7 +4,7 @@
 
 module Lib.Structures.GiST (
     GiST, saveS, leaveS, Within(..), FillFactor(..), Transforming(..),
-    IsGiST, R, BackingStore, read, exactly,
+    IsGiST, R, BackingStore, Reads, Referent, read, exactly,
     empty, insert, search,
     foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv',
     mergeOn
@@ -31,6 +31,7 @@ import Data.Foldable (fold)
 import Control.Monad.Trans.Class (lift)
 import Control.DeepSeq (NFData, rnf)
 import GHC.Generics (Generic)
+import GHC.Exts (Constraint)
 
 import Data.Strict.Tuple (Pair((:!:)))
 import qualified Data.Strict.Tuple as T2
@@ -100,6 +101,8 @@ data GiSTr vec set key value rec
 
 deriving anyclass instance (S.Store (vec (key,value)), S.Store set, S.Store rec) => S.Store (GiSTr vec set key value rec)
 
+deriving anyclass instance S.Store (f (Fix f)) => S.Store (Fix f)
+deriving anyclass instance S.Store (f (g a)) => S.Store (Compose f g a)
 
 newtype GiST f vec set key value = GiST (Fix (Compose f (GiSTr vec set key value)))
 
@@ -145,7 +148,7 @@ instance Key key set => IsGiST V.Vector set key value
 
 {-# INLINE search #-}
 search :: forall vec m set key value q r
-        . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
+        . (IsGiST vec set key value, Monoid q, Monad m, Reads m r vec set key value) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
         -> set 
         -> GiST r vec set key value
@@ -168,15 +171,21 @@ search embed predicate = go
 
 
 class R (m :: * -> *) r | m -> r where
-    read :: r x -> m x
+    type Referent m a :: Constraint
+    read :: Referent m x => r x -> m x
+
+type Reads m r vec set key value = (R m r, Referent m (GiSTr vec set key value (Fix (Compose r (GiSTr vec set key  value))))) 
+
 
 instance R Identity Identity where
+    type Referent Identity _ = ()
     read = id
 
 newtype Transforming t n a = Transforming {transformed :: t n a}
     deriving newtype (Functor, Applicative, Monad, MonadTrans)
 
 instance (R m r, Monad m, MonadTrans t) => R (Transforming t m) r where
+    type Referent (Transforming t m) a = Referent m a
     read = Transforming . lift . read
 
 type Saver m w x = x -> m (w x)
@@ -193,7 +202,7 @@ instance BackingStore Identity Identity Identity vec set k v where
 
 
 {-# INLINABLE insert' #-}
-insert' :: forall m r w vec set k v .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
+insert' :: forall m r w vec set k v .  (Monad m, Reads m r vec set k v, IsGiST vec set k v, BackingStore m r w vec set k v)  
        =>
        FillFactor -> k -> v 
        -> GiST r vec set k v 
@@ -206,7 +215,7 @@ insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
 
 {-# INLINE insertAndSplit #-}
 insertAndSplit :: forall m r w vec set k v 
-               . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
+               . (Monad m, Reads m r vec set k v, IsGiST vec set k v, BackingStore m r w vec set k v) 
                => FillFactor
                -> k -> v
                ->          GiST r vec set k v  
@@ -403,7 +412,7 @@ empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec 
 empty = fmap (GiST . Fix . Compose) $ saveS $ Leaf Vec.empty
 
 {-# INLINE insert #-}
-insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
+insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, Reads m r vec set k v) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
 insert ff k v g = either id id <$> (insert' ff k v g)
 
 

@@ -651,8 +651,8 @@ binarySearch f = \(lo,lv) hi -> go lo lv hi
 data Readers m = Readers {shardShift :: Int, 
                           shards :: V.Vector (ReadQueue m)}
 
-readViaReaders :: MonadConc m => Ref -> Readers m -> m (MVar m ByteString)
-readViaReaders ref Readers{..} = do
+readViaReaders :: MonadConc m => Readers m -> Ref -> m (MVar m ByteString)
+readViaReaders Readers{..} ref = do
     let segHash = hash (refSegment ref)
         mask = (1 `shiftL` shardShift) - 1 
         hash' = segHash .&. mask
@@ -782,13 +782,13 @@ data ReadCache m = ReadCache {
     }
 
 
-readViaReadCache :: MonadConc m => Ref -> ReadCache m -> m (Async m ByteString)
-readViaReadCache ref ReadCache{..} = async $ do
+readViaReadCache :: MonadConc m => ReadCache m -> Ref -> m (Async m ByteString)
+readViaReadCache ReadCache{..} ref  = async $ do
     (hotSegment, hotcache) <- readMVar hot
     if hotSegment == refSegment ref
         then return $ snd (Map.elemAt (fromEnum $ refIx ref) hotcache)
         else do
-            readVar <- readViaReaders ref readers
+            readVar <- readViaReaders readers ref 
             takeMVar readVar
 
 data ConsumerLimits = ConsumerLimits {
@@ -1185,14 +1185,25 @@ type role Reft representational
 newtype Reft a = Reft {reft :: Ref}
     deriving newtype Store
 
+
 -- NB: This does not deal with transactions or flushing
--- instance (MonadConc m, MonadEvaluate m)=> G.BackingStore (DBT NoGC m) Reft Reft VU.Vector (G.Within Int) Int Int where
---     saveS vector = do
---         wq <- dbWriter <$> ask
---         lift $ do
---             pending <- storeToQueue wq (encode vector) ()
---             (ref, _flushed) <- wait pending
---             return (Reft ref)
+instance (MonadConc m, MonadEvaluate m)=> G.BackingStore (DBT NoGC m) Reft Reft VU.Vector (G.Within Int) Int Int where
+    saveS vector = do
+        wq <- dbWriter <$> ask
+        lift $ do
+            pending <- storeToQueue wq (encode vector) ()
+            (ref, _flushed) <- wait pending
+            return (Reft ref)
+    leaveS _ = id
+
+instance MonadConc m => G.R (DBT NoGC m) Reft where
+    type Referent (DBT NoGC m) a = Store a
+    read (Reft ref) = ask >>= \state -> lift $ do
+        let rc = dbReaders state
+        val_ <- readViaReadCache rc ref
+        val <- wait val_
+        return $ decodeEx val
+
 
 test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBT NoGC n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
