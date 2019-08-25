@@ -46,7 +46,7 @@ n_ a l r = Fix (Compose (pure (N a l r)))
 
 
 streamBST :: Monad m => Fix (Compose m (BT a)) -> Stream (Of a) m ()
-streamBST = rfoldr (\a () -> StP.yield a) ()
+streamBST = rfoldr id id (\a () -> StP.yield a) ()
 
 huge :: Int -> Fix (Compose IO (BT Int))
 huge depth = go 0 1
@@ -88,7 +88,7 @@ test2S n =
   Prelude.print
     $ flip State.runState 0
     $ runIdentityT
-    $ (rfoldl' (\acc x -> return (x + acc)) 0 (hugeS n))
+    $ (rfoldl' id id (\acc x -> return (x + acc)) 0 (hugeS n))
 
 testI :: Int -> IO ()
 testI n = Prelude.print $ runIdentity $ StP.length $ streamBST $ hugeI n
@@ -98,7 +98,7 @@ test2I n =
   Prelude.print
     $ runIdentity
     $ runIdentityT
-    $ (rfoldl' (\acc _ -> return ((1 :: Int) + acc)) 0 (hugeI n))
+    $ (rfoldl' id id (\acc _ -> return ((1 :: Int) + acc)) 0 (hugeI n))
 
 
 

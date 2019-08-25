@@ -2,8 +2,8 @@
 
 {-# OPTIONS_GHC -fno-warn-orphans #-}
 
-module Lib.Structures.GiST (
-    GiST, saveS, leaveS, Within(..), FillFactor(..), Transforming(..),
+module Lib.Structures.GiSTn (
+    GiST, saveS, saveZ, leaveS, Within(..), FillFactor(..), Transforming(..),
     IsGiST, R, BackingStore, read, exactly,
     empty, insert, search,
     foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv',
@@ -22,18 +22,15 @@ import Data.Semigroup (Min(Min,getMin))
 import qualified Data.Foldable as Foldable (foldrM, foldlM)
 import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
-import Data.Functor.Compose (Compose(..))
-import Data.Fix (Fix(..))
-import Lib.Structures.Schemes (FoldFix,Lift, rfoldr_, rfoldl'_, rfoldl', rfoldr)
+import Lib.Structures.Schemes (Nat(S,Z), FixN(FixZ,FixN),ComposeI(..),FoldFixI,Lift, rfoldri_, rfoldli'_, rfoldli', rfoldri)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
 import Data.Void (Void)
 import Data.Foldable (fold)
 import Control.Monad.Trans.Class (lift)
--- import Data.Functor.Classes (Show1,showsPrec1)
 
-import Control.DeepSeq (NFData, NFData1, rnf)
-import GHC.Generics (Generic, Generic1)
+import Control.DeepSeq (NFData, rnf)
+import GHC.Generics (Generic)
 
 import Data.Strict.Tuple (Pair((:!:)))
 import qualified Data.Strict.Tuple as T2
@@ -45,87 +42,81 @@ data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
 data V2 x = V2 x x
 
+instance (forall n' . Lift Show (f n')) => Show (FixN n f) where
+    show (FixZ f) = show f
+    show (FixN f) = show f
 
-data FoldWithoutKey vec set key value rec where
-    FoldWithoutKey :: Vector vec (key,value) => GiSTr vec set key value rec -> FoldWithoutKey vec set key value rec
+data FoldWithoutKey vec set key value n rec where
+    FoldWithoutKey :: Vector vec (key,value) => GiSTr vec set key value n rec -> FoldWithoutKey vec set key value n rec
 
-data FoldWithKey vec set kv rec where
-    FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v rec -> FoldWithKey vec set kv rec
+data FoldWithKey vec set kv n rec where
+    FoldWithKey :: (Vector vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithKey vec set kv n rec
 
-data FoldWithVec set vec_kv rec where
-    FoldWithVec :: (Vector vec kv, vec_kv ~ vec kv, kv ~ (k,v)) => GiSTr vec set k v rec -> FoldWithVec set vec_kv rec
+data FoldWithVec set vec_kv n rec where
+    FoldWithVec :: (Vector vec kv, vec_kv ~ vec kv, kv ~ (k,v)) => GiSTr vec set k v n rec -> FoldWithVec set vec_kv n rec
 
-instance FoldFix (FoldWithoutKey vec set key) where
-    {-# INLINEABLE rfoldr_ #-}
-    rfoldr_ rec = \f b0 (FoldWithoutKey g) -> case g of
+instance FoldFixI (FoldWithoutKey vec set key) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldr (\(_k,v) acc -> f v =<< acc) (return b0) vec -- 
         Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set :!: subtree) acc = rec f acc subtree
-    {-# INLINEABLE rfoldl'_ #-}
-    rfoldl'_ rec = \f b0 (FoldWithoutKey g) -> case g of
+    {-# INLINEABLE rfoldli'_ #-}
+    rfoldli'_ rec = \f b0 (FoldWithoutKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc (_k,v) -> acc >>= flip f v) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
             where
             go  acc (_set :!: subtree) = rec f acc subtree
 
-instance FoldFix (FoldWithKey vec set) where
-    {-# INLINEABLE rfoldr_ #-}
-    rfoldr_ rec = \f b0 (FoldWithKey g) -> case g of
+instance FoldFixI (FoldWithKey vec set) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldr (\kv acc -> f kv =<< acc) (return b0) vec -- 
         Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set :!: subtree) acc = rec f acc subtree
-    {-# INLINEABLE rfoldl'_ #-}
-    rfoldl'_ rec = \f b0 (FoldWithKey g) -> case g of
+    {-# INLINEABLE rfoldli'_ #-}
+    rfoldli'_ rec = \f b0 (FoldWithKey g) -> case g of
         Leaf vec -> Vec.foldl' (\acc kv -> acc >>= flip f kv) (return b0) vec -- 
         Node vec -> Foldable.foldlM go b0 vec
             where
             go  acc (_set :!: subtree) = rec f acc subtree
 
 
-instance FoldFix (FoldWithVec set) where
-    {-# INLINEABLE rfoldr_ #-}
-    rfoldr_ rec = \f b0 (FoldWithVec g) -> case g of
+instance FoldFixI (FoldWithVec set) where
+    {-# INLINEABLE rfoldri_ #-}
+    rfoldri_ rec = \f b0 (FoldWithVec g) -> case g of
         Leaf vec -> f vec b0
         Node vec -> Foldable.foldrM go b0 vec
             where
             go (_set :!: subtree) acc = rec f acc subtree
-    {-# INLINEABLE rfoldl'_ #-}
-    rfoldl'_ rec = \f b0 (FoldWithVec g) -> case g of
+    {-# INLINEABLE rfoldli'_ #-}
+    rfoldli'_ rec = \f b0 (FoldWithVec g) -> case g of
         Leaf vec -> f b0 vec 
         Node vec -> Foldable.foldlM go b0 vec
             where
             go  acc (_set :!: subtree) = rec f acc subtree
 
-data GiSTr vec set key value rec
-    = Leaf !(vec (key,value))
-    | Node !(V.Vector (Pair set rec))
-    -- deriving (Generic, Generic1)
-
-
--- deriving anyclass instance Lift NFData f => NFData (Fix f)
-
-newtype GiST f vec set key value = GiST (Fix (Compose f (GiSTr vec set key value)))
---     deriving Generic
-
--- instance (NFData (vec (key,value)), NFData set, Lift NFData f) => NFData (GiST f vec set key value)
-
--- instance Lift NFData f => NFData (Fix f) where
---     rnf (Fix f) = rnf f
-
--- deriving anyclass instance (NFData (vec (key,value)), NFData1 f, NFData1 (Pair set), NFData1 V.Vector) =>  NFData (GiST f vec set key value)
+data GiSTr vec set key value n rec where
+    Leaf :: !(vec (key,value)) -> GiSTr vec set key value 'Z rec
+    Node :: !(V.Vector (Pair set rec)) -> GiSTr vec set key value ('S n) rec
 
 instance (S.Store a, S.Store b) => S.Store (Pair a b) where
     size = contramap (\(a :!: b) -> (a,b)) S.size
     peek = fmap (\(a,b) -> (a :!: b)) S.peek
     poke = S.poke . (\(a :!: b) -> (a,b))
 
-instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value rec) where
+instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value 'Z rec) where
     size = contramap (\(Leaf v) -> v) S.size
     poke = S.poke . (\(Leaf v) -> v)
     peek = fmap Leaf S.peek
 
+
+instance (S.Store set, S.Store rec) => S.Store (GiSTr vec set key value ('S n) rec) where
+    size = contramap (\(Node v) -> v) S.size
+    poke = S.poke . (\(Node v) -> v)
+    peek = fmap Node S.peek
 
 
 instance (NFData a, NFData b) => NFData (Pair a b) where
@@ -134,22 +125,29 @@ instance Functor (Pair a) where
     fmap f (a :!: b) = (a :!: f b )
 
 
--- instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value rec) where
---     rnf (Leaf v) = rnf v
---     rnf (Node v) = rnf v
+instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value n rec) where
+    rnf (Leaf v) = rnf v
+    rnf (Node v) = rnf v
 
+data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
 
-instance (Show set, Show rec, Show (vec (key, value))) => Show (GiSTr vec set key value rec) where
+-- instance ((forall r . S.Store r => S.Store (f r)), S.Store (vec (key,value)), S.Store set) => S.Store (GiSTn f vec set key value n) where
+--     size = contramap (\(GiSTn v) -> v) S.size
+--     poke = S.poke . (\(GiSTn v) -> v)
+--     peek = fmap GiSTn S.peek
+
+instance (forall a . NFData a => NFData (f a), NFData (vec (key,value)), NFData set) => NFData (GiSTn f vec set key value n) where
+    rnf (GiSTn g) = rnf g
+
+instance (Show set, Show rec, Show (vec (key, value))) => Show (GiSTr vec set key value n rec) where
     show (Leaf vec) = "(Leaf " ++ show vec ++ ")"
     show (Node vec) = "(Node " ++ show vec ++ ")"
 
--- instance Show1 (GiSTr vec set key value) where
---     showsPrec1 = showsPrec 
+instance (Lift Show f, forall n' . Lift Show (g n'), Show a) => Show (ComposeI f g n a) where
+    show (ComposeI x) = show x
 
-
--- instance (Show set, Show (vec (key, value)), Show1 f) => Show (GiST f vec set key value) where
---     show (GiST x) = show x
-
+instance (Show set, Show (vec (key, value)), Lift Show f) => Show (GiSTn f vec set key value n) where
+    show (GiSTn x) = show x
 
 data FillFactor = FillFactor {minFill :: Int, maxFill :: Int} deriving Show
 
@@ -168,29 +166,40 @@ instance (VU.Unbox key, VU.Unbox value, Key key set) => IsGiST VU.Vector set key
 instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key value
 instance Key key set => IsGiST V.Vector set key value
 
-{-# INLINE search #-}
-search :: forall vec height m set key value q r
+{-# INLINE search' #-}
+search' :: forall vec height m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
         -> set 
-        -> GiST r vec set key value
+        -> GiSTn r vec set key value height
         -> m q
-search embed predicate = go
+search' embed predicate = go
     where
-    go :: GiST r vec set key value  -> m q
-    go (GiST (Fix (Compose g))) = do
+    go :: forall height' . GiSTn r vec set key value height' -> m q
+    go (GiSTn fix) = case fix of
+        FixZ (ComposeI g) -> do
             q <- read g
             case q of
                 Leaf vec -> embed (Vec.filter (overlaps predicate . exactly . fst) vec)
+        FixN (ComposeI g) -> do
+            q <- read g
+            case q of
                 Node vec -> do
                     let f acc (subpred :!: subgist) = if overlaps predicate subpred 
                         then do
-                            subacc <- go (GiST subgist)
+                            subacc <- go (GiSTn subgist)
                             return (acc <> subacc)
                         else return acc
                     Vec.foldM f mempty (vec)
 
-
+{-# INLINABLE search #-}
+search :: forall vec m set key value q r
+        . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
+        => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
+        -> set 
+        -> GiST r vec set key value
+        -> m q 
+search e p (GiST g) = search' e p g
 
 class R (m :: * -> *) r | m -> r where
     read :: r x -> m x
@@ -207,78 +216,84 @@ instance (R m r, Monad m, MonadTrans t) => R (Transforming t m) r where
 type Saver m w x = x -> m (w x)
 
 class BackingStore m r w vec set k v | m -> r w where
-    saveS :: Saver m w (GiSTr vec set k v (Fix (Compose w (GiSTr vec set k v))))
-    leaveS :: forall proxy . proxy m -> GiST r vec set k v -> GiST w vec set k v
+    saveS :: forall h . Saver m w (GiSTr vec set k v ('S h) (FixN h (ComposeI w (GiSTr vec set k v))))
+    saveZ :: Saver m w (GiSTr vec set k v 'Z Void)
+    leaveS :: forall h proxy . proxy m -> GiSTn r vec set k v h -> GiSTn w vec set k v h
 
 instance BackingStore Identity Identity Identity vec set k v where
     {-# INLINE saveS #-}
     saveS = Identity . Identity
+    {-# INLINE saveZ #-}
+    saveZ = Identity . Identity
     {-# INLINE leaveS #-}
     leaveS _ = id
 
 
 {-# INLINABLE insert' #-}
-insert' :: forall m r w vec set k v .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
+insert' :: forall m r w vec set k v h .  (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v)  
        =>
        FillFactor -> k -> v 
-       -> GiST r vec set k v 
-       -> m (Either ((GiST w vec set k v)) ((GiST w vec set k v)))
+       -> GiSTn r vec set k v h
+       -> m (Either ((GiSTn w vec set k v h)) ((GiSTn w vec set k v ('S h))))
 insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
             One (_set :!: gist) -> return $ Left gist
-            Two (aSet  :!:  GiST aGiST) (bSet :!: GiST bGiST) -> fmap (Right . GiST . Fix . Compose) $ saveS node 
+            Two (aSet  :!:  GiSTn aGiSTn) (bSet :!: GiSTn bGiSTn) -> fmap (Right . GiSTn . FixN . ComposeI) $ saveS node 
                 where
-                node =  Node $ V.fromList [(aSet :!: aGiST), (bSet :!: bGiST)]
+                node =  Node $ V.fromList [(aSet :!: aGiSTn), (bSet :!: bGiSTn)]
 
 {-# INLINE insertAndSplit #-}
 insertAndSplit :: forall m r w vec set k v h
                . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
                => FillFactor
                -> k -> v
-               ->          GiST r vec set k v  
-               -> m (AFew (Pair set (GiST w vec set k v))) -- That which has been saved
+               ->          GiSTn r vec set k v h    
+               -> m (AFew (Pair set (GiSTn w vec set k v h))) -- That which has been saved
 insertAndSplit ff@FillFactor{..} key value = go 
     where
-    go :: GiST r vec set k v  -> m (AFew (Pair set (GiST w vec set k v)))
-    go !(GiST (Fix (Compose (free))))  = do
-        read @m @r free >>= \case 
-            Leaf vec -> do
-                let newVecs :: AFew (vec (k, v))
-                    newVecs = insertKey (Proxy @set) ff key value vec  
-                    setOf = unions . map (exactly . fst) . Vec.toList 
-                    save = fmap (GiST . Fix . Compose) . saveS . Leaf
-                traverse (\entries -> ((setOf entries :: set)  :!:) <$> save entries) newVecs    
-            Node vec -> do
-                case chooseSubtree vec (exactly key) of
-                    Nothing -> error "GiST node is empty, violating data structure invariants"
-                    Just (bestIx, best) -> do
-                        inserted <- go (GiST best)
-                        let reuse r = let (GiST w) = leaveS (Proxy @m) (GiST r) in w
-                            force v =  Vec.foldl' (\u p -> p `seq` u) () v
-                        case inserted of
-                            One (set  :!: GiST gist) -> do
-                                let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set :!: gist))]
-                                let set' = unions $ map T2.fst $ Vec.toList vec'
+    go :: forall h' . GiSTn r vec set k v h' -> m (AFew (Pair set (GiSTn w vec set k v h')))
+    go !(GiSTn (FixZ (ComposeI (free))))  = do
+        vec <- read @m @r free >>= \case Leaf vec -> return vec
+        let newVecs :: AFew (vec (k, v))
+            newVecs = insertKey (Proxy @set) ff key value vec  
+            setOf = unions . map (exactly . fst) . Vec.toList 
+            save = fmap (GiSTn . FixZ . ComposeI) . saveZ . Leaf
+        traverse (\entries -> ((setOf entries :: set)  :!:) <$> save entries) newVecs    
+    go !(GiSTn (FixN (ComposeI (free)))) = do
+        node <- read @m @r free 
+        let vec = foo $ case node of Node v -> foo v 
+        case chooseSubtree node (exactly key) of
+            Nothing -> error "GiST node is empty, violating data structure invariants"
+            Just (bestIx, best) -> do
+                inserted <- go (GiSTn best)
+                let reuse r = let (GiSTn w) = leaveS (Proxy @m) (GiSTn r) in w
+                    force v =  Vec.foldl' (\u p -> p `seq` u) () v
+                case inserted of
+                    One (set  :!: GiSTn gist) -> do
+                        let vec' = fmap (fmap reuse) vec Vec.// [(bestIx,(set :!: gist))]
+                        let set' = unions $ map T2.fst $ Vec.toList vec'
+                        let !() = force vec'
+                        saved <- saveS (Node vec')
+                        return $ One (set' :!: (GiSTn $ FixN $ ComposeI saved))
+                    Two (setL :!: GiSTn l) (setR  :!:  GiSTn r) -> do
+                        let untouched = fmap (fmap reuse) vec
+                        let wrap vec' = do
                                 let !() = force vec'
                                 saved <- saveS (Node vec')
-                                return $ One (set' :!: (GiST $ Fix $ Compose saved))
-                            Two (setL :!: GiST l) (setR  :!:  GiST r) -> do
-                                let untouched = fmap (fmap reuse) vec
-                                let wrap vec' = do
-                                        let !() = force vec'
-                                        saved <- saveS (Node vec')
-                                        return (unions (fmap T2.fst vec') :!: (GiST $ Fix $ Compose saved))
-                                case partitionSets ff untouched bestIx (V2 (setL :!: l) (setR :!: r)) of
-                                    One v -> One <$> wrap v
-                                    Two v1 v2 -> Two <$> wrap v1 <*> wrap v2
+                                return (unions (fmap T2.fst vec') :!: (GiSTn $ FixN $ ComposeI saved))
+                        case partitionSets ff untouched bestIx (V2 (setL :!: l) (setR :!: r)) of
+                            One v -> One <$> wrap v
+                            Two v1 v2 -> Two <$> wrap v1 <*> wrap v2
 
 
+foo :: V.Vector (Pair a b) -> V.Vector (Pair a b)
+foo = id
 
 {-# INLINE chooseSubtree #-}
-chooseSubtree :: forall vec set k x . (Key k set)
-              => V.Vector (Pair set x)
+chooseSubtree :: forall vec set k v h x . (IsGiST vec set k v)
+              => GiSTr vec set k v ('S h) x
               -> set 
               -> Maybe (Int, x)
-chooseSubtree  vec predicate = ignored . getMin <$> bestSubtree
+chooseSubtree (Node vec) predicate = ignored . getMin <$> bestSubtree
     where
     bestSubtree = Vec.ifoldl' (\best i next -> best <> f i next) Nothing vec
     f ix (subpred  :!:  subgist) = Just $ Min $ Ignoring (ix, subgist) (penalty predicate subpred) -- Can replace penalty with any ord
@@ -365,38 +380,70 @@ mergeOn f a b = Vec.create $ do
     return v
 
 
+data GiST f vec set key value where
+    GiST :: !(GiSTn f vec set key value height) -> GiST f vec set key value
 
+-- instance (S.Store set, S.Store (vec (key,value)), (forall r . S.Store r => S.Store (f r))) => S.Store (GiST f vec set key value) where
+--     size = S.VarSize $ \case
+--         (GiST (GiSTn (FixZ fg))) -> case S.size of
+--             S.VarSize f -> 1 + f fg
+--             S.ConstSize c -> 1 + c
+--         (GiST (GiSTn (FixN fg))) -> case contramap (GiST . GiSTn) S.size of
+--             S.VarSize f -> 1 + f fg
+--             S.ConstSize c -> 1 + c
+--     poke = undefined 
+--         -- \case
+--         -- (GiST (GiSTn (FixZ fg))) -> S.poke (0 :: Word8) >> S.poke fg
+--         -- (GiST (GiSTn (FixN fg))) -> S.poke (1 :: Word8) >> S.poke fg
+--     peek = undefined
+
+-- instance (S.Store set, S.Store rec) => S.Store (GiSTr vec set key value ('S n) rec) where
+--     size = contramap (\(Node v) -> v) S.size
+--     poke = S.poke . (\(Node v) -> v)
+--     peek = fmap Node S.peek
+
+-- instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value 'Z rec) where
+
+-- data GiSTn f vec set key value n = GiSTn (FixN n (ComposeI f (GiSTr vec set key value)))
+
+
+
+instance (NFData (vec (key,value)), NFData set, forall a . NFData a => NFData (f a)) => NFData (GiST f vec set key value) where
+    rnf (GiST g) = rnf g
+
+instance (Lift Show f, Functor f, Show set, Show (vec (key, value))) => Show (GiST f vec set key value) where
+    show (GiST g) = show g
 
 {-# INLINE cronk #-}
 cronk :: Monad m => (a -> b -> c) -> (a -> b -> m c)
-cronk f a b = return (f a b) 
+cronk f a b = return (f a b)
 
 
 {-# INLINE foldrM #-}
 foldrM :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (v -> b -> t m b) -> b -> GiST r vec set key v -> t m b
-foldrM r2m f b (GiST g) = rfoldr r2m FoldWithoutKey f b g
+foldrM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithoutKey f b g
 
 
 {-# INLINE foldriM #-}
 foldriM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> ((k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
-foldriM r2m f b (GiST g) = rfoldr r2m FoldWithKey f b g
+foldriM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithKey f b g
 
 
 {-# INLINE foldrvM #-}
 foldrvM :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (vec (k,v) -> b -> t m b) -> b -> GiST r vec set k v -> t m b
-foldrvM r2m f b (GiST g) = rfoldr r2m FoldWithVec f b g
+foldrvM r2m f b (GiST (GiSTn g)) = rfoldri r2m FoldWithVec f b g
 
 {-# INLINE foldlM' #-}
 foldlM' :: (Monad m, Vector vec (key,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> v -> t m b) -> b -> GiST r vec set key v -> t m b
-foldlM' r2m f b (GiST g) = rfoldl' r2m FoldWithoutKey f b g
+foldlM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithoutKey f b g
 
 {-# INLINE foldliM' #-}
 foldliM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
-foldliM' r2m f b (GiST g) = rfoldl' r2m FoldWithKey f b g
+foldliM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithKey f b g
 
 {-# INLINE foldlvM' #-}
 foldlvM' :: (Monad m, Vector vec (k,v), MonadTrans t, (forall n . Monad n => Monad (t n))) =>  (forall x . r x -> m x) -> (b -> vec (k,v) -> t m b) -> b -> GiST r vec set k v -> t m b
-foldlvM' r2m f b (GiST g) = rfoldl' r2m FoldWithVec f b g
+foldlvM' r2m f b (GiST (GiSTn g)) = rfoldli' r2m FoldWithVec f b g
 
 
 {-# INLINE foldr #-}
@@ -425,11 +472,11 @@ foldlv' r2m f b = runIdentityT . foldlvM' r2m (cronk f) b
 
 
 empty :: forall vec set k v m r w . (IsGiST vec set k v, BackingStore m r w vec set k v, Functor m) => m (GiST w vec set k v)
-empty = fmap (GiST . Fix . Compose) $ saveS $ Leaf Vec.empty
+empty = fmap (GiST . GiSTn . FixZ . ComposeI) $ saveZ $ Leaf Vec.empty
 
 {-# INLINE insert #-}
 insert :: forall vec set k v m r w .  (IsGiST vec set k v, BackingStore m r w vec set k v, Monad m, R m r) => FillFactor -> k -> v -> GiST r vec set k v -> m (GiST w vec set k v)
-insert ff k v g = either id id <$> (insert' ff k v g)
+insert ff k v (GiST !g) = either GiST GiST <$> (insert' ff k v g)
 
 
 
