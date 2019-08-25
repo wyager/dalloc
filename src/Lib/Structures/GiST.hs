@@ -24,22 +24,17 @@ import Data.Proxy (Proxy(Proxy))
 import Data.Functor.Identity (Identity(..))
 import Data.Functor.Compose (Compose(..))
 import Data.Fix (Fix(..))
-import Lib.Structures.Schemes (FoldFix,Lift, rfoldr_, rfoldl'_, rfoldl', rfoldr)
+import Lib.Structures.Schemes (FoldFix, rfoldr_, rfoldl'_, rfoldl', rfoldr)
 import Control.Monad.Trans.Identity (runIdentityT)
 import Control.Monad.Trans.Class (MonadTrans)
-import Data.Void (Void)
 import Data.Foldable (fold)
 import Control.Monad.Trans.Class (lift)
--- import Data.Functor.Classes (Show1,showsPrec1)
-
-import Control.DeepSeq (NFData, NFData1, rnf)
-import GHC.Generics (Generic, Generic1)
+import Control.DeepSeq (NFData, rnf)
+import GHC.Generics (Generic)
 
 import Data.Strict.Tuple (Pair((:!:)))
 import qualified Data.Strict.Tuple as T2
 import Data.Functor.Contravariant (contramap)
-
-import Data.Word (Word8)
 
 data AFew xs = One xs | Two xs xs deriving (Functor, Foldable, Traversable)
 
@@ -101,33 +96,21 @@ instance FoldFix (FoldWithVec set) where
 data GiSTr vec set key value rec
     = Leaf !(vec (key,value))
     | Node !(V.Vector (Pair set rec))
-    -- deriving (Generic, Generic1)
+    deriving (Generic)
 
+deriving anyclass instance (S.Store (vec (key,value)), S.Store set, S.Store rec) => S.Store (GiSTr vec set key value rec)
 
--- deriving anyclass instance Lift NFData f => NFData (Fix f)
 
 newtype GiST f vec set key value = GiST (Fix (Compose f (GiSTr vec set key value)))
 
 instance NFData (GiST f vec set key value) where
     rnf (GiST (Fix (Compose f))) = f `seq` ()
---     deriving Generic
-
--- instance (NFData (vec (key,value)), NFData set, Lift NFData f) => NFData (GiST f vec set key value)
-
--- instance Lift NFData f => NFData (Fix f) where
---     rnf (Fix f) = rnf f
-
--- deriving anyclass instance (NFData (vec (key,value)), NFData1 f, NFData1 (Pair set), NFData1 V.Vector) =>  NFData (GiST f vec set key value)
 
 instance (S.Store a, S.Store b) => S.Store (Pair a b) where
     size = contramap (\(a :!: b) -> (a,b)) S.size
     peek = fmap (\(a,b) -> (a :!: b)) S.peek
     poke = S.poke . (\(a :!: b) -> (a,b))
 
-instance (S.Store (vec (key,value))) => S.Store (GiSTr vec set key value rec) where
-    size = contramap (\(Leaf v) -> v) S.size
-    poke = S.poke . (\(Leaf v) -> v)
-    peek = fmap Leaf S.peek
 
 
 
@@ -137,21 +120,10 @@ instance Functor (Pair a) where
     fmap f (a :!: b) = (a :!: f b )
 
 
--- instance (NFData (vec (key,value)), NFData set, NFData rec) => NFData (GiSTr vec set key value rec) where
---     rnf (Leaf v) = rnf v
---     rnf (Node v) = rnf v
-
 
 instance (Show set, Show rec, Show (vec (key, value))) => Show (GiSTr vec set key value rec) where
     show (Leaf vec) = "(Leaf " ++ show vec ++ ")"
     show (Node vec) = "(Node " ++ show vec ++ ")"
-
--- instance Show1 (GiSTr vec set key value) where
---     showsPrec1 = showsPrec 
-
-
--- instance (Show set, Show (vec (key, value)), Show1 f) => Show (GiST f vec set key value) where
---     show (GiST x) = show x
 
 
 data FillFactor = FillFactor {minFill :: Int, maxFill :: Int} deriving Show
@@ -172,7 +144,7 @@ instance (VS.Storable (key,value), Key key set) => IsGiST VS.Vector set key valu
 instance Key key set => IsGiST V.Vector set key value
 
 {-# INLINE search #-}
-search :: forall vec height m set key value q r
+search :: forall vec m set key value q r
         . (IsGiST vec set key value, Monoid q, Monad m, R m r) 
         => (vec (key,value) -> m q) -- You can either use the monoid m or the monad f to get the result out.
         -> set 
@@ -233,7 +205,7 @@ insert' ff k v g= insertAndSplit @m @r @w ff k v g >>= \case
                 node =  Node $ V.fromList [(aSet :!: aGiST), (bSet :!: bGiST)]
 
 {-# INLINE insertAndSplit #-}
-insertAndSplit :: forall m r w vec set k v h
+insertAndSplit :: forall m r w vec set k v 
                . (Monad m, R m r, IsGiST vec set k v, BackingStore m r w vec set k v) 
                => FillFactor
                -> k -> v
@@ -277,7 +249,7 @@ insertAndSplit ff@FillFactor{..} key value = go
 
 
 {-# INLINE chooseSubtree #-}
-chooseSubtree :: forall vec set k x . (Key k set)
+chooseSubtree :: forall set k x . (Key k set)
               => V.Vector (Pair set x)
               -> set 
               -> Maybe (Int, x)
