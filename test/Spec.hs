@@ -83,6 +83,7 @@ main =
         "GiST over Identity has equivalent behavior to a map (V/64/S)"
         (testMapEquivalence @V.Vector @Word64 @String Proxy)
       , testProperty "Writing then reading works as expected" (ioProperty . readsFollowWrites)
+      , testProperty "GiST read/write over a database works as expected" (ioProperty . uncurry backendGiSTBehavior)
       , testDejafus [("No deadlocks", deadlocksNever), ("No exceptions", exceptionsNever)] demoMock
       ]
 
@@ -113,6 +114,13 @@ readsFollowWrites seed = do
   fs         <- genRandomFilesystem mockDBConfig s1
   (_fs', ok) <- test fs mockDBConfig (readEqualsWrite s2)
   return ok
+
+backendGiSTBehavior :: G.FillFactor -> Int -> IO Bool
+backendGiSTBehavior ff seed = do
+  let gen = mkStdGen seed
+  fs <- genRandomFilesystem mockDBConfig gen
+  (_fs', list) <- test fs mockDBConfig (testBackendEquiv ff 100)
+  return (list == [(k,k) | k <- [0..99]])
 
 
 simulate :: (forall m . MonadConc m => m a) -> a
@@ -192,7 +200,7 @@ testMapEquivalence _ fill assocs = runIdentity
      . ( G.IsGiST vec set k v
        , G.BackingStore m rw rw vec set k v
        , Monad m
-       , G.R m rw
+       , G.Reads m rw vec set k v
        , Eq (vec (k, v))
        , Ord k
        , Eq v
@@ -216,4 +224,16 @@ testMapEquivalence _ fill assocs = runIdentity
       gistList  <- G.foldr G.read (:) [] gist
       gistListK <- G.foldri G.read (:) [] gist
       return (gistListK == Map.toList theMap && gistList == Map.elems theMap)
+
+testBackendEquiv
+  :: forall rw m . 
+  (G.IsGiST VU.Vector (G.Within Int) Int Int, 
+    G.BackingStore m rw rw VU.Vector (G.Within Int) Int Int, 
+    Monad m, 
+    G.Reads m rw VU.Vector (G.Within Int) Int Int) 
+  => G.FillFactor -> Int -> m [(Int,Int)]
+testBackendEquiv ff i = do
+  gist :: G.GiST rw VU.Vector (G.Within Int) Int Int <- Gex.bigSet' ff i 
+  Gex.toList (G.Within 0 i) gist 
+
 

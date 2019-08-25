@@ -4,31 +4,37 @@ import qualified Lib.Structures.Schemes.Example as ST
 import qualified Lib.Structures.GiST.Example as Ex
 import qualified Lib.Structures.GiST as G
 import Data.Time.Clock (getCurrentTime)
+import Control.Monad.Identity (runIdentity)
+import qualified  Lib.Storage.System as SS
 
-main = do
-  print =<< getCurrentTime
-  putStrLn "Creating"
-  let !b = Ex.bigSet (G.FillFactor 16 32) 1000000
-  print =<< getCurrentTime
-  putStrLn "Forcing"
+same :: a -> a -> ()
+same _ _ = ()
 
-  print $ Ex.force b
-  print =<< getCurrentTime
-  putStrLn "fold"
+main = SS.demoIO2
+  -- do
+  -- print =<< getCurrentTime
+  -- putStrLn "Creating 1"
+  -- let !b = runIdentity $ Ex.bigSet'(G.FillFactor 16 32) 1000000 
+  -- print =<< getCurrentTime
+  -- putStrLn "Forcing"
 
-  print $ Ex.speedFold b
-  print =<< getCurrentTime
-  putStrLn "vfold"
+  -- print $ Ex.force b
+  -- print =<< getCurrentTime
+  -- putStrLn "fold"
+
+  -- print $ Ex.speedFold b
+  -- print =<< getCurrentTime
+  -- putStrLn "vfold"
 
 
-  print $ Ex.speedFoldV b
-  print =<< getCurrentTime
-  putStrLn "sfold"
+  -- print $ Ex.speedFoldV b
+  -- print =<< getCurrentTime
+  -- putStrLn "sfold"
 
-  print $ Ex.speedFoldlS b
-  print =<< getCurrentTime
-  putStrLn "ssearch"
+  -- print $ Ex.speedFoldlS b
+  -- print =<< getCurrentTime
+  -- putStrLn "ssearch"
 
-  print $ Ex.speedSearchS b
-  print =<< getCurrentTime
-  putStrLn "done"
+  -- print $ Ex.speedSearchS b
+  -- print =<< getCurrentTime
+  -- putStrLn "done"

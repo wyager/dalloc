@@ -26,12 +26,19 @@ s2 :: SP.Stream (SP.Of (Int, Char)) Identity ()
 s2 = G.transformed
   $ G.search (VU.foldM_ (\() (k, v) -> G.Transforming $ SP.yield (k, v)) ()) (G.Within 6 20) f
 
+{-# INLINE bigSet #-}
 bigSet :: G.FillFactor -> Int -> G.GiST Identity Vector (G.Within Int) Int Int
-bigSet ff n = go 0 e
- where
-  go !i !g
-    | i == n    = g
-    | otherwise = go (i + 1) $ runIdentity $ G.insert ff i i g
+bigSet ff n = runIdentity $ bigSet' ff n
+
+{-# INLINE bigSet' #-}
+bigSet' :: forall vec rw m . (G.IsGiST vec (G.Within Int) Int Int, G.BackingStore m rw rw vec (G.Within Int) Int Int, Monad m, G.Reads m rw vec (G.Within Int) Int Int) => G.FillFactor -> Int -> m (G.GiST rw vec (G.Within Int) Int Int)
+bigSet' ff n = go 0 =<< G.empty
+  where
+  go !i !g 
+    | i == n = return g
+    | otherwise = do
+        g' <- G.insert ff i i g
+        go (i + 1) g'
 
 force :: G.GiST Identity Vector (G.Within Int) Int Int -> Int
 force g = runIdentity $ G.foldli' id (\a (k, v) -> a + k + v) 0 g

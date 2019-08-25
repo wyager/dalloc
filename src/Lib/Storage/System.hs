@@ -3,6 +3,7 @@
 module Lib.Storage.System  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
+import qualified Data.Store as Store
 import           Control.Concurrent.Classy.Async (Async, async, link, waitAny, wait)
 import           Control.Concurrent.Classy.MVar (MVar, newEmptyMVar, takeMVar, putMVar, swapMVar, readMVar, newMVar, modifyMVar)
 import           Control.DeepSeq (NFData, rnf, force)
@@ -50,6 +51,9 @@ import           System.Random (RandomGen, randomR)
 import           Data.Tuple (swap)
 import           Data.Proxy (Proxy(Proxy))
 import qualified Lib.Structures.GiST as G
+import qualified Lib.Structures.GiST.Example as Gex
+import Data.Functor.Contravariant (contramap)
+
 -- import           Data.Coerce (coerce)
 
 newtype Segment = Segment Word64
@@ -1177,13 +1181,44 @@ demoIO = do
     print (length refs)
 
 
+-- TODO: When there's no rundir, we get a dumb STM errors. Probably not dealing with exceptions correctly
+demoIO2 :: IO () 
+demoIO2 = do
+    let cfg = defaultDBConfig "/tmp/rundir"
+    putStrLn "Setting up"
+    state <- setupIO @NoGC cfg 
+    let action :: DBT NoGC IO Int = do
+            gist :: G.GiST Reft VU.Vector (G.Within Int) Int Int <- Gex.bigSet' (G.FillFactor 16 32) 100000
+            G.foldl' G.read (+) 0 gist
+    total <- runDBT action state 
+    print total
+    -- Now flush
+    let wq = dbWriter state 
+    write <- storeToQueue wq "All done" ()
+    refAsync <- async $ do
+        (ref, flush) <- wait write
+        Flushed <- takeMVar flush
+        return ref
+    flushWriteQueue wq
+    (_,_) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsync]
+    return ()
+    -- flushWriteQueue $ dbWriter state
+    -- putStrLn "Waiting for flush"
+    -- (_, refs) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsyncs]
+    -- print (length refs)
+
 newtype DBT gc m a = DBT {runDBT :: DBState m gc -> m a}
     deriving (Functor, Applicative, Monad, MonadReader (DBState m gc)) via (ReaderT (DBState m gc) m)
 instance MonadTrans (DBT gc) where lift = DBT . const
 
-type role Reft representational
-newtype Reft a = Reft {reft :: Ref}
-    deriving newtype Store
+type role Reft nominal
+data Reft a where
+    Reft :: Store a => Ref -> Reft a
+
+instance Store a => Store (Reft a) where
+    size = contramap (\(Reft r) -> r) Store.size
+    peek = fmap Reft Store.peek
+    poke = Store.poke . (\(Reft r) -> r)
 
 
 -- NB: This does not deal with transactions or flushing
@@ -1197,7 +1232,7 @@ instance (MonadConc m, MonadEvaluate m)=> G.BackingStore (DBT NoGC m) Reft Reft 
     leaveS _ = id
 
 instance MonadConc m => G.R (DBT NoGC m) Reft where
-    type Referent (DBT NoGC m) a = Store a
+    -- type Referent (DBT NoGC m) a = Store a
     read (Reft ref) = ask >>= \state -> lift $ do
         let rc = dbReaders state
         val_ <- readViaReadCache rc ref

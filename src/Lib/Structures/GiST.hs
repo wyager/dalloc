@@ -4,7 +4,7 @@
 
 module Lib.Structures.GiST (
     GiST, saveS, leaveS, Within(..), FillFactor(..), Transforming(..),
-    IsGiST, R, BackingStore, Reads, Referent, read, exactly,
+    IsGiST, R, BackingStore, Reads, {- Referent, -} read, exactly,
     empty, insert, search,
     foldrM, foldriM, foldrvM, foldlM', foldliM', foldlvM', foldr, foldri, foldrv, foldl', foldli', foldlv',
     mergeOn
@@ -31,7 +31,7 @@ import Data.Foldable (fold)
 import Control.Monad.Trans.Class (lift)
 import Control.DeepSeq (NFData, rnf)
 import GHC.Generics (Generic)
-import GHC.Exts (Constraint)
+-- import GHC.Exts (Constraint)
 
 import Data.Strict.Tuple (Pair((:!:)))
 import qualified Data.Strict.Tuple as T2
@@ -115,10 +115,8 @@ instance (S.Store a, S.Store b) => S.Store (Pair a b) where
     poke = S.poke . (\(a :!: b) -> (a,b))
 
 
-
-
 instance (NFData a, NFData b) => NFData (Pair a b) where
-    rnf (a :!: b) = rnf (a,b)
+    rnf (a :!: b) = rnf a `seq` rnf b
 instance Functor (Pair a) where 
     fmap f (a :!: b) = (a :!: f b )
 
@@ -171,21 +169,21 @@ search embed predicate = go
 
 
 class R (m :: * -> *) r | m -> r where
-    type Referent m a :: Constraint
-    read :: Referent m x => r x -> m x
+    -- type Referent m a :: Constraint
+    read :: {- Referent m x => -} r x -> m x
 
-type Reads m r vec set key value = (R m r, Referent m (GiSTr vec set key value (Fix (Compose r (GiSTr vec set key  value))))) 
+type Reads m r vec set key value = (R m r) -- , Referent m (GiSTr vec set key value (Fix (Compose r (GiSTr vec set key  value))))) 
 
 
 instance R Identity Identity where
-    type Referent Identity _ = ()
+    -- type Referent Identity _ = ()
     read = id
 
 newtype Transforming t n a = Transforming {transformed :: t n a}
     deriving newtype (Functor, Applicative, Monad, MonadTrans)
 
 instance (R m r, Monad m, MonadTrans t) => R (Transforming t m) r where
-    type Referent (Transforming t m) a = Referent m a
+    -- type Referent (Transforming t m) a = Referent m a
     read = Transforming . lift . read
 
 type Saver m w x = x -> m (w x)
