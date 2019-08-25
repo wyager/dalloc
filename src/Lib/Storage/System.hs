@@ -1182,6 +1182,7 @@ demoIO = do
 
 
 -- TODO: When there's no rundir, we get a dumb STM errors. Probably not dealing with exceptions correctly
+-- TODO: Also, can this lock up? Should run this under test
 demoIO2 :: IO () 
 demoIO2 = do
     let cfg = defaultDBConfig "/tmp/rundir"
