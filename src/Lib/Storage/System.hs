@@ -1188,20 +1188,20 @@ demoIO2 = do
     let cfg = defaultDBConfig "/tmp/rundir"
     putStrLn "Setting up"
     state <- setupIO @NoGC cfg 
-    let action :: DBT NoGC IO Int = do
-            gist :: G.GiST Reft VU.Vector (G.Within Int) Int Int <- Gex.bigSet' (G.FillFactor 16 32) 100000
-            G.foldl' G.read (+) 0 gist
-    total <- runDBT action state 
-    print total
-    -- Now flush
-    let wq = dbWriter state 
-    write <- storeToQueue wq "All done" ()
-    refAsync <- async $ do
+    ref <- async $ do
+        let action :: DBT NoGC IO Int = do
+                gist :: G.GiST Reft VU.Vector (G.Within Int) Int Int <- Gex.bigSet' (G.FillFactor 8 16) 100000
+                G.foldl' G.read (+) 0 gist
+        total <- runDBT action state
+        print total
+        -- Now flush
+        let wq = dbWriter state 
+        write <- storeToQueue wq "All done" ()
         (ref, flush) <- wait write
+        flushWriteQueue wq
         Flushed <- takeMVar flush
         return ref
-    flushWriteQueue wq
-    (_,_) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, refAsync]
+    (_,_) <- waitAny [absurd <$> dbReaderExn state, absurd <$> dbWriterExn state, ref]
     return ()
     -- flushWriteQueue $ dbWriter state
     -- putStrLn "Waiting for flush"
@@ -1250,9 +1250,5 @@ test initialFS cfg theTest =  do
         runDBT theTest state
     finalFS <- readMVar fsState
     return (finalFS, result)
-
-
-
-
 
 

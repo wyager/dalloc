@@ -10,7 +10,7 @@ import qualified  Lib.Storage.System as SS
 same :: a -> a -> ()
 same _ _ = ()
 
-main = SS.demoIO
+main = SS.demoIO2
   -- do
   -- print =<< getCurrentTime
   -- putStrLn "Creating 1"
