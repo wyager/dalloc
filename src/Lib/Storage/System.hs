@@ -1,6 +1,27 @@
 {-# LANGUAGE UndecidableInstances #-} -- So that we can GND-derive MonadConc instances for transformers 
 {-# LANGUAGE RoleAnnotations #-}  
-module Lib.Storage.System  where
+module Lib.Storage.System (
+    demoIO2
+  , test
+  , DBT(..)
+  , NoGC
+  , MonadEvaluate
+  , DBState
+  , FakeHandle
+  , MockDBMT
+  , DBConfig
+  , readViaReadCache
+  , flushWriteQueue
+  , dbWriterExn
+  , dbReaderExn
+  , storeToQueue
+  , dbReaders
+  , dbWriter
+  , mockDBConfig
+  , defaultDBConfig
+  , setupIO
+  , Reft
+    )  where
 
 import           Data.Store (Store, encode, decode, decodeEx, PeekException) 
 import qualified Data.Store as Store

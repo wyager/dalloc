@@ -8,7 +8,7 @@ import qualified Data.Vector.Unboxed as VU
 
 
 main :: IO ()
-main = CM.runMode (CMO.Run CM.defaultConfig CMO.Prefix [""]) [ff 16 32]
+main = CM.runMode (CMO.Run CM.defaultConfig CMO.Prefix [""]) [ff 16 32, ff 32 64, ff 64 128]
  where
   ff min max = CM.bgroup (show (min, max)) (withFF (G.FillFactor min max))
   addUp ff = CM.env
@@ -23,16 +23,16 @@ main = CM.runMode (CMO.Run CM.defaultConfig CMO.Prefix [""]) [ff 16 32]
       ]
     )
   withFF ff@(G.FillFactor _min max_) =
-    [ addUp ff
-    , CM.bench "insert max elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) max_
-    , CM.bench "insert (max+1) elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) (max_ + 1)
-    , CM.bench "insert 100 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 100
+    [ CM.bench "insert max elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) max_
+    -- , CM.bench "insert (max+1) elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) (max_ + 1)
+    -- , CM.bench "insert 100 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 100
     , CM.bench "insert 1,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 1000
-    , CM.bench "insert 10,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 10000
-    , CM.bench "insert 100,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 100000
-    , CM.bench "insert 1,000,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 1000000
+    -- , CM.bench "insert 10,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 10000
+    -- , CM.bench "insert 100,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 100000
+    -- , CM.bench "insert 1,000,000 elements into Identity-backed GiST" $ CM.nf (Gex.bigSet ff) 1000000
     , CM.bench "insert 1,000 elements into In-memory Database backed GiST" $ CM.nfIO (dbTestMem ff 1000)
-    , CM.bench "insert 1,000 elements into In-memory Database backed GiST" $ CM.nfIO (dbTestDisk ff 1000)
+    , CM.bench "insert 1,000 elements into Disk Database backed GiST" $ CM.nfIO (dbTestDisk ff 1000)
+    -- , addUp ff
     ]
   dbTestMem :: G.FillFactor -> Int -> IO Int
   dbTestMem ff n = do
