@@ -1262,6 +1262,7 @@ instance MonadConc m => G.R (DBT NoGC m) Reft where
         return $ decodeEx val
 
 
+{-# SPECIALIZE test :: Map FilePath Builder -> DBConfig (MockDBMT IO) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBT NoGC n a) -> IO (Map FilePath Builder, a) #-}
 test :: MonadConc m => Map FilePath Builder -> DBConfig (MockDBMT m) FakeHandle -> (forall n . (MonadConc n, MonadEvaluate n) => DBT NoGC n a) -> m (Map FilePath Builder, a)
 test initialFS cfg theTest =  do
     fsState <- newMVar initialFS
